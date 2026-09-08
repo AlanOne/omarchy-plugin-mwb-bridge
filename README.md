@@ -87,19 +87,15 @@ supervises over `systemctl` and a couple of JSON files.
    **Save and restart**. The keyboard layout is detected automatically
    (via `hyprctl`) — no need to set it by hand.
 
-4. See **On the Windows side** below — a required manual step on the
-   Windows PC.
-
 ### On the Windows side
 
-See `daemon/PROTOCOL.md` for the full story of why PowerToys' own UI
-isn't enough for this: fully close PowerToys, hand-edit
+Fully close PowerToys, hand-edit
 `%LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\settings.json`
 to add this machine to both `MachineMatrixString` and `MachinePool`
-(name + the ID shown in the widget's popup), then relaunch. For example,
-if this machine is named `omarchy` with ID `987654321`, and the existing
-file already has your Windows PC as `WINPC`/`123456789` in one slot —
-among the many other properties already in the file:
+(name + the ID shown in the widget's popup), then relaunch. If your
+machine is named `omarchy` with ID `987654321`, and the existing file
+already has your Windows PC as `WINPC`/`123456789` in one slot — among
+the many other properties already in the file:
 
 ```json
 {

@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.alanone.mwb-bridge",
+  "name": "MWB Bridge",
+  "version": "1.0.0",
+  "author": "Alan",
+  "license": "MIT",
+  "description": "Status and control for the Mouse Without Borders bridge daemon: shows whether the paired Windows PC is connected, lets you edit the shared security key / Windows IP / this machine's name from the popup, and start, stop, or restart the daemon service.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "MWB Bridge",
+    "description": "Mouse Without Borders bridge status + control",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "popupWidth": 340
+    },
+    "schema": [
+      {
+        "key": "popupWidth",
+        "type": "number",
+        "label": "Popup width (pixels, before theme spacing scale)",
+        "defaultValue": 340
+      }
+    ]
+  }
+}

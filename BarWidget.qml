@@ -56,11 +56,23 @@ BarWidget {
   property int machineId: 0
   property string saveMessage: ""
 
+  // This machine's actual active XKB layout/variant — read fresh from
+  // Hyprland (never hardcoded) whenever settings are saved, so the daemon's
+  // virtual keyboard always matches whatever this specific install is
+  // actually running, not whatever machine the plugin was written on.
+  property string detectedXkbLayout: "us"
+  property string detectedXkbVariant: ""
+
   function refreshServiceState() { serviceStateProc.running = true }
+  function detectXkbLayout() {
+    xkbLayoutProc.running = true
+    xkbVariantProc.running = true
+  }
 
   Component.onCompleted: {
     if (root.machineId === 0) root.machineId = Math.floor(Math.random() * 4294967295)
     root.refreshServiceState()
+    root.detectXkbLayout()
   }
 
   FileView {
@@ -100,6 +112,12 @@ BarWidget {
         nameField.text = String(c.machine_name || "")
         var id = Number(c.machine_id)
         if (id) root.machineId = id
+        // Fallback only — detectXkbLayout() (already running from
+        // Component.onCompleted) overwrites these with a fresh live read
+        // moments later. Keeping whatever was last saved here means a
+        // failed hyprctl call can't silently reset the layout to "us".
+        if (c.xkb_layout) root.detectedXkbLayout = String(c.xkb_layout)
+        if (c.xkb_variant !== undefined) root.detectedXkbVariant = String(c.xkb_variant)
       } catch (e) {
         // Malformed — leave the form as-is (either still empty, on first
         // ever load, or whatever the user was already editing).
@@ -112,12 +130,49 @@ BarWidget {
       security_key: keyField.text,
       windows_ip: ipField.text.trim(),
       machine_name: nameField.text.trim(),
-      machine_id: root.machineId
+      machine_id: root.machineId,
+      xkb_layout: root.detectedXkbLayout,
+      xkb_variant: root.detectedXkbVariant
     }
     configFile.setText(JSON.stringify(cfg, null, 2) + "\n")
     chmodProc.running = true
     restartProc.running = true
     root.saveMessage = "Saved — restarting service..."
+  }
+
+  // `hyprctl getoption` is the live source of truth for this machine's
+  // actual active layout — never hardcode a layout here, it has to match
+  // whatever install this actually is.
+  Process {
+    id: xkbLayoutProc
+    command: ["hyprctl", "getoption", "input:kb_layout", "-j"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(String(text || ""))
+          if (parsed.str) root.detectedXkbLayout = String(parsed.str)
+        } catch (e) {
+          // Leave the previous/default value — better than an empty layout.
+        }
+      }
+    }
+  }
+
+  Process {
+    id: xkbVariantProc
+    command: ["hyprctl", "getoption", "input:kb_variant", "-j"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var parsed = JSON.parse(String(text || ""))
+          root.detectedXkbVariant = String(parsed.str || "")
+        } catch (e) {
+          // Leave the previous/default value.
+        }
+      }
+    }
   }
 
   // config.json carries the shared security key in plaintext, same

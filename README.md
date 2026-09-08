@@ -29,7 +29,9 @@ This repo is two things in one:
   standard Omarchy plugin layout) — a thin QML front-end giving the daemon
   a status icon plus a popup for start/stop/restart and settings (shared
   security key, Windows PC address, this machine's name). It doesn't
-  implement any of the actual input-forwarding logic itself.
+  implement any of the actual input-forwarding logic itself, and it builds
+  and installs the daemon for you the first time it loads (see below) —
+  there's nothing to build or install by hand.
 
 They're split this way because plugins run unsandboxed inside the
 long-running Omarchy shell process — real protocol/crypto/Wayland-protocol
@@ -38,23 +40,9 @@ supervises over `systemctl` and a couple of JSON files.
 
 ## Install
 
-1. **Build the daemon:**
-
-   ```sh
-   cd daemon
-   cargo build --release
-   mkdir -p ~/.config/systemd/user
-   cp systemd/mwb-omarchy-bridge.service ~/.config/systemd/user/
-   # Edit ExecStart in the copied unit to point at wherever you checked
-   # this repo out (it defaults to ~/Work/mwb-omarchy-bridge/daemon).
-   systemctl --user daemon-reload
-   systemctl --user enable --now mwb-omarchy-bridge.service
-   ```
-
-2. **Install the plugin.** If you checked this repo out somewhere other
-   than `~/.config/omarchy/plugins/io.github.alanone.mwb-bridge/`, symlink
-   or copy it there, then add it to your bar layout in
-   `~/.config/omarchy/shell.json`:
+1. Check this repo out to `~/.config/omarchy/plugins/io.github.alanone.mwb-bridge/`
+   (or symlink it there from wherever you cloned it), then add it to your
+   bar layout in `~/.config/omarchy/shell.json`:
 
    ```json
    {
@@ -62,20 +50,46 @@ supervises over `systemctl` and a couple of JSON files.
    }
    ```
 
+2. Reload the bar (or just wait for it to notice). The first time the
+   widget loads, it automatically builds the daemon (`cargo build
+   --release` in `daemon/` — needs a Rust toolchain installed; this can
+   take a minute) and installs + enables its systemd `--user` service.
+   The popup shows a status line while this is happening. Every load after
+   the first just checks these are already in place and skips straight to
+   normal status polling — it won't second-guess a Stop you clicked
+   yourself.
+
 3. Open the widget's popup (bar icon) and fill in the Security Key,
    Windows PC's IP or hostname, and a name for this machine, then hit
    **Save and restart**. The keyboard layout is detected automatically
    (via `hyprctl`) — no need to set it by hand.
 
 4. **On the Windows side** (see `daemon/PROTOCOL.md` for the full story of
-   why PowerToys' own UI isn't enough for this):
-   - Fully close PowerToys, hand-edit
-     `%LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\settings.json`
-     to add this machine to both `MachineMatrixString` and `MachinePool`
-     (name + the ID shown in the widget's popup), then relaunch.
-   - Add a hosts-file entry
-     (`C:\Windows\System32\drivers\etc\hosts`) mapping this machine's name
-     to its LAN IP, so Windows can resolve it for edge-crossing routing.
+   why PowerToys' own UI isn't enough for this): fully close PowerToys,
+   hand-edit
+   `%LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\settings.json`
+   to add this machine to both `MachineMatrixString` and `MachinePool`
+   (name + the ID shown in the widget's popup), then relaunch. For example,
+   if this machine is named `omarchy` with ID `987654321`, and the existing
+   file already has your Windows PC as `WINPC`/`123456789` in one slot —
+   among the many other properties already in the file:
+
+   ```json
+   {
+     "properties": {
+       "MachineMatrixString": ["omarchy", "WINPC", "", ""],
+       "MachinePool": { "value": "WINPC:123456789,omarchy:987654321,:,:" }
+     }
+   }
+   ```
+
+   `MachineMatrixString` position encodes physical left/right layout for
+   edge-crossing — put your machine on whichever side matches your actual
+   desk setup. If Windows can't resolve this machine's name for
+   edge-crossing routing (a "cannot resolve IP address" toast), add either
+   an IP Mapping entry in PowerToys' own settings UI or a hosts-file entry
+   (`C:\Windows\System32\drivers\etc\hosts`) — neither was needed on the
+   network this was built on, but your router/DNS setup may differ.
 
 ## Config files (written by the plugin, read by the daemon)
 
@@ -104,10 +118,7 @@ by hand works just as well as using the popup:
   hostname doesn't.
 - `machine_id` can be any number — the plugin picks a random one the first
   time it runs and reuses it after that. `machine_name`/`machine_id` must
-  exactly match what you add to Windows' `MachinePool` setting (see
-  `daemon/PROTOCOL.md`'s "Matrix and MachinePool" section — the classic UI
-  can't actually persist this in this PowerToys version, so it has to be
-  hand-edited into `settings.json` directly).
+  exactly match what you add to Windows' `MachinePool` setting (see above).
 - `xkb_layout`/`xkb_variant` are filled in automatically by the plugin
   (`hyprctl getoption input:kb_layout -j` / `input:kb_variant -j`) every
   time you save — hand-editing them only matters if you're running the
@@ -139,19 +150,12 @@ updated_epoch}`) — this is what the bar widget polls for display.
   why — it turned out not to be load-bearing, but is harmless to keep).
 - `daemon/src/main.rs` — Phase 1 PoC: Wayland virtual pointer/keyboard
   injection, no networking. Kept as a minimal standalone reference.
-- `daemon/src/bin/mwb_probe.rs`, `daemon/src/bin/mwb_readonly.rs` — early
-  protocol-debugging test clients, superseded by `daemon.rs` and the
-  shared `lib.rs` modules; not yet refactored to use them (technical debt,
-  not currently needed for anything).
 - `daemon/PROTOCOL.md` — the full reverse-engineered wire protocol spec,
   plus everything learned about Windows-side state (the Matrix/MachinePool
   UI persistence bug, DNS/IP-mapping quirks, keyboard-layout translation).
   Read this before changing any of the crypto/framing/handshake/keymap
   code.
-- `daemon/systemd/mwb-omarchy-bridge.service` — the service unit template.
-
-## Next steps
-
-- Refactor `daemon/src/bin/mwb_probe.rs`/`mwb_readonly.rs` to use the
-  shared `lib.rs` modules, or remove them — they're pure technical debt at
-  this point.
+- `daemon/systemd/mwb-omarchy-bridge.service` — the service unit template
+  the plugin generates on first run (with `ExecStart` pointing at wherever
+  it actually built the binary) — kept here mainly as a reference/fallback
+  for running the daemon without the plugin.

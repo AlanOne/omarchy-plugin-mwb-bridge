@@ -33,6 +33,31 @@ BarWidget {
   readonly property string statusPath: root.dataDir + "/status.json"
   readonly property string serviceName: "mwb-omarchy-bridge.service"
 
+  // This widget's own directory, whatever it was actually installed at —
+  // resolved from the QML file's own URL rather than assuming the
+  // canonical ~/.config/omarchy/plugins/... path, so first-run setup below
+  // works regardless of where this got checked out.
+  readonly property string pluginDir: {
+    var url = Qt.resolvedUrl(".").toString()
+    if (url.indexOf("file://") === 0) url = url.substring("file://".length)
+    return url.replace(/\/+$/, "")
+  }
+  readonly property string daemonDir: root.pluginDir + "/daemon"
+  // Built outside the plugin directory entirely: cargo writes thousands of
+  // files under target/ during a build, and Quickshell's local-plugin
+  // file-watcher reacts to changes anywhere under the plugin's own
+  // directory tree — building in-place was observed triggering repeated
+  // mid-build widget reloads (each harmlessly re-checking already-done
+  // setup steps, but wasteful, and a plausible source of races with an
+  // in-flight setctl chain). A fixed cache dir sidesteps that entirely.
+  readonly property string buildCacheDir: root.home + "/.cache/omarchy-mwb-bridge-build"
+  readonly property string daemonBinaryPath: root.buildCacheDir + "/release/daemon"
+  readonly property string systemdUnitPath: root.home + "/.config/systemd/user/" + root.serviceName
+
+  // Non-empty only while first-run setup (build + install the systemd
+  // unit) is actually in progress or has just failed; shown in the popup.
+  property string setupStatus: ""
+
   property bool popupOpen: false
   property bool showKey: false
   function close() { root.popupOpen = false }
@@ -71,8 +96,110 @@ BarWidget {
 
   Component.onCompleted: {
     if (root.machineId === 0) root.machineId = Math.floor(Math.random() * 4294967295)
-    root.refreshServiceState()
     root.detectXkbLayout()
+    root.ensureDaemonSetUp()
+  }
+
+  // First-run setup: build the daemon binary if it's missing, then make
+  // sure the systemd unit exists and is enabled — both are no-ops (just
+  // the two cheap `test` checks) on every load after the first, so this
+  // never fights a user's own Start/Stop choice on subsequent widget loads.
+  function ensureDaemonSetUp() { checkBinaryProc.running = true }
+
+  Process {
+    id: checkBinaryProc
+    command: ["test", "-x", root.daemonBinaryPath]
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.ensureServiceUnit()
+      } else {
+        root.setupStatus = "First-time setup: building the daemon (can take a minute)..."
+        buildDaemonProc.running = true
+      }
+    }
+  }
+
+  Process {
+    id: buildDaemonProc
+    command: ["cargo", "build", "--release", "--target-dir", root.buildCacheDir]
+    workingDirectory: root.daemonDir
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.setupStatus = ""
+        root.ensureServiceUnit()
+      } else {
+        root.setupStatus = "Daemon build failed — install Rust (rustup.rs), then run `cargo build --release` in " + root.daemonDir + " yourself."
+      }
+    }
+  }
+
+  function ensureServiceUnit() { checkUnitProc.running = true }
+
+  Process {
+    id: checkUnitProc
+    command: ["test", "-f", root.systemdUnitPath]
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.refreshServiceState()
+      } else {
+        mkdirSystemdDirProc.running = true
+      }
+    }
+  }
+
+  Process {
+    id: mkdirSystemdDirProc
+    command: ["mkdir", "-p", root.home + "/.config/systemd/user"]
+    onExited: function(exitCode) { root.writeServiceUnit() }
+  }
+
+  function writeServiceUnit() {
+    var unit =
+      "[Unit]\n" +
+      "Description=MWB Omarchy Bridge (Mouse Without Borders client/server daemon)\n" +
+      "After=graphical-session.target\n" +
+      "PartOf=graphical-session.target\n" +
+      "\n" +
+      "[Service]\n" +
+      "ExecStart=" + root.daemonBinaryPath + "\n" +
+      "Restart=always\n" +
+      "RestartSec=3\n" +
+      "\n" +
+      "[Install]\n" +
+      "WantedBy=graphical-session.target\n"
+    unitFile.setText(unit)
+    daemonReloadProc.running = true
+  }
+
+  FileView {
+    id: unitFile
+    path: root.systemdUnitPath
+    printErrors: false
+    atomicWrites: true
+  }
+
+  Process {
+    id: daemonReloadProc
+    command: ["systemctl", "--user", "daemon-reload"]
+    onExited: function(exitCode) { enableServiceProc.running = true }
+  }
+
+  Process {
+    id: enableServiceProc
+    command: ["systemctl", "--user", "enable", "--now", root.serviceName]
+    onExited: function(exitCode) {
+      // "enable --now" occasionally leaves the unit enabled-but-not-started
+      // (seen once during testing, cause unclear — possibly a race with
+      // graphical-session.target during a shell restart) — one explicit
+      // start covers that case for free; a no-op if it's already running.
+      startAfterInstallProc.running = true
+    }
+  }
+
+  Process {
+    id: startAfterInstallProc
+    command: ["systemctl", "--user", "start", root.serviceName]
+    onExited: function(exitCode) { root.refreshServiceState() }
   }
 
   FileView {
@@ -259,6 +386,17 @@ BarWidget {
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.subtitle
         font.bold: true
+      }
+
+      Text {
+        width: parent.width
+        visible: root.setupStatus !== ""
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+        text: root.setupStatus
+        color: root.setupStatus.indexOf("failed") !== -1 ? Color.urgent : Color.accent
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
       }
 
       Text {

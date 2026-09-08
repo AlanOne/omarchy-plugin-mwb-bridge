@@ -56,15 +56,23 @@ supervises over `systemctl` and a couple of JSON files.
 
 ## Install
 
-1. Check this repo out to `~/.config/omarchy/plugins/io.github.alanone.mwb-bridge/`
-   (or symlink it there from wherever you cloned it), then add it to your
-   bar layout in `~/.config/omarchy/shell.json`:
+1. Install the plugin, either way:
 
-   ```json
-   {
-     "id": "io.github.alanone.mwb-bridge"
-   }
-   ```
+   - **Via Omarchy's own plugin command** (also reachable from its menu —
+     search for "Add Plugin"): `omarchy plugin add
+     https://github.com/AlanOne/omarchy-plugin-mwb-bridge.git --enable`.
+     This clones it, validates the manifest, and adds it to your bar
+     layout for you.
+   - **Manually**: check this repo out to
+     `~/.config/omarchy/plugins/io.github.alanone.mwb-bridge/` (or symlink
+     it there from wherever you cloned it), then add it to your bar
+     layout in `~/.config/omarchy/shell.json` yourself:
+
+     ```json
+     {
+       "id": "io.github.alanone.mwb-bridge"
+     }
+     ```
 
 2. Reload the bar (or just wait for it to notice). The first time the
    widget loads, it automatically builds the daemon (needs a Rust

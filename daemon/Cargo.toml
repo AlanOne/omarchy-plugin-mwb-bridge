@@ -1,0 +1,20 @@
+[package]
+name = "mwb_omarchy_bridge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.9.3"
+cbc = "0.2.1"
+hex = "0.4.3"
+memfd = "0.6.6"
+pbkdf2 = "0.13.0"
+rand = "0.10.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+xkbcommon = "0.9.0"

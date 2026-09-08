@@ -304,7 +304,7 @@ BarWidget {
       TextField {
         id: ipField
         width: parent.width
-        placeholderText: "Windows IP or hostname:port (e.g. CHP-ALANJ.local:15101)"
+        placeholderText: "Windows IP or hostname:port (e.g. WINPC.local:15101)"
       }
 
       TextField {

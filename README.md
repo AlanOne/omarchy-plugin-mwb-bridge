@@ -2,7 +2,7 @@
 
 A status + control widget for [mwb-omarchy-bridge](https://github.com/AlanOne/mwb-omarchy-bridge)
 — a software-KVM daemon that lets a Windows PC's physical keyboard/mouse (via Microsoft
-PowerToys' **Mouse Without Borders**) control this Omarchy (Hyprland) machine directly,
+PowerToys' **Mouse Without Borders**) control an Omarchy (Hyprland) machine directly,
 without going through any of the mainstream tools (Synergy/Barrier/Input Leap/Deskflow),
 none of which currently work on Hyprland.
 

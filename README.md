@@ -26,6 +26,9 @@ current rough edges.
 - **Typing sometimes registers too many keystrokes** — occasional extra/
   duplicate key events land on the Omarchy side for a single physical
   keypress. Not yet root-caused.
+- **Clipboard sharing isn't implemented.** The real Mouse Without Borders
+  also syncs the clipboard between machines; this bridge only reimplements
+  mouse/keyboard forwarding, not that part of the protocol.
 
 ## How it's put together
 

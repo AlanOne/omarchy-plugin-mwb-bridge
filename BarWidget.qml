@@ -467,7 +467,7 @@ BarWidget {
         width: parent.width
         textFormat: Text.PlainText
         wrapMode: Text.WordWrap
-        text: "Must exactly match a PowerToys Mouse Without Borders install on the paired Windows PC (same Security Key). This machine's name and ID below also need hand-adding to that PC's settings.json (MachineMatrixString + MachinePool) — the classic UI can't persist that reliably in this PowerToys version. See PROTOCOL.md in the mwb-omarchy-bridge repo."
+        text: "Same Security Key as your Windows PC's Mouse Without Borders setup. You'll also need to manually add this machine's name and ID (below) to Windows' settings — see daemon/PROTOCOL.md for exact steps."
         color: Qt.darker(root.bar.foreground, 1.4)
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption

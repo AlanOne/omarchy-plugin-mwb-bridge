@@ -25,9 +25,6 @@ user service. See **Known bugs** below for current rough edges.
 - **Typing sometimes registers too many keystrokes** — occasional extra/
   duplicate key events land on the Omarchy side for a single physical
   keypress. Not yet root-caused.
-- **Clipboard sharing isn't implemented.** The real Mouse Without Borders
-  also syncs the clipboard between machines; this bridge only reimplements
-  mouse/keyboard forwarding, not that part of the protocol.
 
 ## Ideas for later
 
@@ -38,6 +35,9 @@ user service. See **Known bugs** below for current rough edges.
   in Omarchy itself) at the same time — either the daemon reacting to a
   Lock-type packet from Windows if one exists in the protocol, or just a
   second, independent hotkey on this side.
+- **Clipboard sharing.** The real Mouse Without Borders also syncs the
+  clipboard between machines; this bridge only reimplements mouse/
+  keyboard forwarding, not that part of the protocol.
 
 ## How it's put together
 

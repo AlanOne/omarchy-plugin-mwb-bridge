@@ -72,7 +72,7 @@ BarWidget {
 
   readonly property bool connected: root.statusConnected && root.serviceState === "active"
   readonly property string tooltipText: root.serviceState !== "active"
-    ? "Mouse Without Borders (Windows PowerToys) Omarchy Bridge: service " + root.serviceState
+    ? "MWB Bridge: service " + root.serviceState
     : (root.statusConnected ? "Connected to " + root.statusPeer : root.statusDetail)
 
   // Never left at 0: seeded eagerly in Component.onCompleted so a fresh
@@ -351,7 +351,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰒃"
+    text: "󰍹"
     slotSize: Style.bar.statusSlot
     active: root.popupOpen
     foreground: root.connected ? root.bar.barForeground : Qt.darker(root.bar.barForeground, 1.8)
@@ -381,7 +381,7 @@ BarWidget {
 
       Text {
         textFormat: Text.PlainText
-        text: "Mouse Without Borders (Windows PowerToys) Omarchy Bridge"
+        text: "MWB Bridge"
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.subtitle

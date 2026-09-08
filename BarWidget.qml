@@ -351,7 +351,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍹"
+    text: "󰢹"
     slotSize: Style.bar.statusSlot
     active: root.popupOpen
     foreground: root.connected ? root.bar.barForeground : Qt.darker(root.bar.barForeground, 1.8)

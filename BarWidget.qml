@@ -32,6 +32,7 @@ BarWidget {
   readonly property string configPath: root.dataDir + "/config.json"
   readonly property string statusPath: root.dataDir + "/status.json"
   readonly property string serviceName: "mwb-omarchy-bridge.service"
+  readonly property string windowsSideDocsUrl: "https://github.com/AlanOne/omarchy-plugin-mwb-bridge/blob/master/README.md#on-the-windows-side"
 
   // This widget's own directory, whatever it was actually installed at —
   // resolved from the QML file's own URL rather than assuming the
@@ -465,12 +466,19 @@ BarWidget {
 
       Text {
         width: parent.width
-        textFormat: Text.PlainText
+        textFormat: Text.StyledText
         wrapMode: Text.WordWrap
-        text: "Same Security Key as your Windows PC's Mouse Without Borders setup. You'll also need to manually add this machine's name and ID (below) to Windows' settings — see daemon/PROTOCOL.md for exact steps."
+        text: "Same Security Key as your Windows PC's Mouse Without Borders setup. You'll also need to manually add this machine's name and ID (below) to Windows' settings — " +
+          "<a href=\"" + root.windowsSideDocsUrl + "\">see exact steps</a>."
         color: Qt.darker(root.bar.foreground, 1.4)
+        linkColor: Color.accent
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
+        onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+
+        HoverHandler {
+          cursorShape: parent.hoveredLink !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor
+        }
       }
 
       Row {

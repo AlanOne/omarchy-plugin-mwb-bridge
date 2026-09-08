@@ -72,7 +72,7 @@ BarWidget {
 
   readonly property bool connected: root.statusConnected && root.serviceState === "active"
   readonly property string tooltipText: root.serviceState !== "active"
-    ? "MWB Bridge: service " + root.serviceState
+    ? "Mouse Without Borders (Windows PowerToys) Omarchy Bridge: service " + root.serviceState
     : (root.statusConnected ? "Connected to " + root.statusPeer : root.statusDetail)
 
   // Never left at 0: seeded eagerly in Component.onCompleted so a fresh
@@ -381,7 +381,7 @@ BarWidget {
 
       Text {
         textFormat: Text.PlainText
-        text: "MWB Bridge"
+        text: "Mouse Without Borders (Windows PowerToys) Omarchy Bridge"
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.subtitle

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "io.github.alanone.mwb-bridge",
-  "name": "MWB Bridge",
+  "name": "Mouse Without Borders (Windows PowerToys) Omarchy Bridge",
   "version": "1.0.0",
   "author": "Alan",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "MWB Bridge",
+    "displayName": "Mouse Without Borders (Windows PowerToys) Omarchy Bridge",
     "description": "Mouse Without Borders bridge status + control",
     "category": "Info",
     "allowMultiple": false,

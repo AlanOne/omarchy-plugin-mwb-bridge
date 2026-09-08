@@ -1,4 +1,4 @@
-# MWB Bridge
+# Mouse Without Borders (Windows PowerToys) Omarchy Bridge
 
 An Omarchy bar-widget plugin, with its own bundled daemon, that lets a
 Windows PC's physical keyboard/mouse (via Microsoft PowerToys' **Mouse
@@ -9,9 +9,23 @@ Hyprland because `xdg-desktop-portal-hyprland` doesn't implement the
 `RemoteDesktop` portal they all depend on.
 
 **Status: working end-to-end.** Mouse (movement, clicks, scroll) and
-keyboard (including modifiers and non-US layouts) both forward correctly,
-via either edge-crossing or the `Ctrl+Alt+F1`-style hotkey switch, and it
-runs as an auto-starting, auto-reconnecting systemd user service.
+keyboard both forward correctly, via either edge-crossing or the
+`Ctrl+Alt+F1`-style hotkey switch, and it runs as an auto-starting,
+auto-reconnecting systemd user service. See **Known bugs** below for
+current rough edges.
+
+## Known bugs
+
+- **Keyboard layout issues.** VK→evdev translation (`daemon/src/
+  vk_keycode.rs`) has only been verified against a Slovenian (QWERTZ)
+  layout. Other layouts are likely to hit wrong characters somewhere,
+  especially punctuation/OEM keys — Windows can reassign those to
+  different physical keys per layout in ways that aren't derivable from
+  the VK code alone (see `daemon/PROTOCOL.md`'s keyboard-layout section
+  for how to work out a fix for your own layout empirically).
+- **Typing sometimes registers too many keystrokes** — occasional extra/
+  duplicate key events land on the Omarchy side for a single physical
+  keypress. Not yet root-caused.
 
 ## How it's put together
 

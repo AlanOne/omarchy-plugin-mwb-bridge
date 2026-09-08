@@ -9,10 +9,9 @@ Hyprland because `xdg-desktop-portal-hyprland` doesn't implement the
 `RemoteDesktop` portal they all depend on.
 
 **Status: working end-to-end.** Mouse (movement, clicks, scroll) and
-keyboard both forward correctly, via either edge-crossing or the
-`Ctrl+Alt+F1`-style hotkey switch, and it runs as an auto-starting,
-auto-reconnecting systemd user service. See **Known bugs** below for
-current rough edges.
+keyboard both forward, via either edge-crossing or the `Ctrl+Alt+F1`-style
+hotkey switch, and it runs as an auto-starting, auto-reconnecting systemd
+user service. See **Known bugs** below for current rough edges.
 
 ## Known bugs
 
@@ -68,13 +67,12 @@ supervises over `systemctl` and a couple of JSON files.
    ```
 
 2. Reload the bar (or just wait for it to notice). The first time the
-   widget loads, it automatically builds the daemon (`cargo build
-   --release` in `daemon/` — needs a Rust toolchain installed; this can
-   take a minute) and installs + enables its systemd `--user` service.
-   The popup shows a status line while this is happening. Every load after
-   the first just checks these are already in place and skips straight to
-   normal status polling — it won't second-guess a Stop you clicked
-   yourself.
+   widget loads, it automatically builds the daemon (needs a Rust
+   toolchain installed; this can take a minute) and installs + enables its
+   systemd `--user` service. The popup shows a status line while this is
+   happening. Every load after the first just checks these are already in
+   place and skips straight to normal status polling — it won't
+   second-guess a Stop you clicked yourself.
 
 3. Open the widget's popup (bar icon) and fill in the Security Key,
    Windows PC's IP or hostname, and a name for this machine, then hit
@@ -88,29 +86,29 @@ supervises over `systemctl` and a couple of JSON files.
 
 See `daemon/PROTOCOL.md` for the full story of why PowerToys' own UI
 isn't enough for this: fully close PowerToys, hand-edit
-   `%LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\settings.json`
-   to add this machine to both `MachineMatrixString` and `MachinePool`
-   (name + the ID shown in the widget's popup), then relaunch. For example,
-   if this machine is named `omarchy` with ID `987654321`, and the existing
-   file already has your Windows PC as `WINPC`/`123456789` in one slot —
-   among the many other properties already in the file:
+`%LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\settings.json`
+to add this machine to both `MachineMatrixString` and `MachinePool`
+(name + the ID shown in the widget's popup), then relaunch. For example,
+if this machine is named `omarchy` with ID `987654321`, and the existing
+file already has your Windows PC as `WINPC`/`123456789` in one slot —
+among the many other properties already in the file:
 
-   ```json
-   {
-     "properties": {
-       "MachineMatrixString": ["omarchy", "WINPC", "", ""],
-       "MachinePool": { "value": "WINPC:123456789,omarchy:987654321,:,:" }
-     }
-   }
-   ```
+```json
+{
+  "properties": {
+    "MachineMatrixString": ["omarchy", "WINPC", "", ""],
+    "MachinePool": { "value": "WINPC:123456789,omarchy:987654321,:,:" }
+  }
+}
+```
 
-   `MachineMatrixString` position encodes physical left/right layout for
-   edge-crossing — put your machine on whichever side matches your actual
-   desk setup. If Windows can't resolve this machine's name for
-   edge-crossing routing (a "cannot resolve IP address" toast), add either
-   an IP Mapping entry in PowerToys' own settings UI or a hosts-file entry
-   (`C:\Windows\System32\drivers\etc\hosts`) — neither was needed on the
-   network this was built on, but your router/DNS setup may differ.
+`MachineMatrixString` position encodes physical left/right layout for
+edge-crossing — put your machine on whichever side matches your actual
+desk setup. If Windows can't resolve this machine's name for
+edge-crossing routing (a "cannot resolve IP address" toast), add either
+an IP Mapping entry in PowerToys' own settings UI or a hosts-file entry
+(`C:\Windows\System32\drivers\etc\hosts`) — neither was needed on the
+network this was built on, but your router/DNS setup may differ.
 
 ## Config files (written by the plugin, read by the daemon)
 
@@ -125,7 +123,7 @@ by hand works just as well as using the popup:
   "security_key": "your PowerToys Mouse Without Borders shared security key",
   "windows_ip": "your Windows PC's LAN IP or hostname:15101",
   "machine_name": "pick a name for this machine, e.g. its hostname",
-  "machine_id": 123456789,
+  "machine_id": 987654321,
   "xkb_layout": "the XKB layout this machine's keyboard actually uses, e.g. us",
   "xkb_variant": ""
 }
@@ -143,12 +141,8 @@ by hand works just as well as using the popup:
 - `xkb_layout`/`xkb_variant` are filled in automatically by the plugin
   (`hyprctl getoption input:kb_layout -j` / `input:kb_variant -j`) every
   time you save — hand-editing them only matters if you're running the
-  daemon without the plugin. See `daemon/PROTOCOL.md`'s keyboard-layout
-  section for why letters and punctuation need different per-layout
-  handling, and how to work out any additional per-key fixes
-  (`daemon/src/vk_keycode.rs`) your own layout needs empirically — this
-  repo currently only has fixes verified against a QWERTZ (Slovenian)
-  layout; other layouts likely need their own.
+  daemon without the plugin. See **Known bugs** above for why this alone
+  doesn't guarantee correct typing on every layout.
 - The file contains the shared key in plaintext — keep it `chmod 600`
   (the plugin does this after every save).
 
@@ -167,8 +161,8 @@ updated_epoch}`) — this is what the bar widget polls for display.
 - `daemon/src/bin/daemon.rs` — **the real thing.** A persistent, auto-
   reconnecting client connection to Windows' message server, decoding
   Mouse/Keyboard packets into Wayland input; plus a listener on the same
-  port for Windows' side of the connection pair (see `PROTOCOL.md` for
-  why — it turned out not to be load-bearing, but is harmless to keep).
+  port for Windows' side of the connection pair (see `daemon/PROTOCOL.md`
+  for why — it turned out not to be load-bearing, but is harmless to keep).
 - `daemon/src/main.rs` — Phase 1 PoC: Wayland virtual pointer/keyboard
   injection, no networking. Kept as a minimal standalone reference.
 - `daemon/PROTOCOL.md` — the full reverse-engineered wire protocol spec,
@@ -176,7 +170,12 @@ updated_epoch}`) — this is what the bar widget polls for display.
   UI persistence bug, DNS/IP-mapping quirks, keyboard-layout translation).
   Read this before changing any of the crypto/framing/handshake/keymap
   code.
-- `daemon/systemd/mwb-omarchy-bridge.service` — the service unit template
-  the plugin generates on first run (with `ExecStart` pointing at wherever
-  it actually built the binary) — kept here mainly as a reference/fallback
-  for running the daemon without the plugin.
+- `daemon/systemd/mwb-omarchy-bridge.service` — a reference unit for
+  building and running the daemon manually (`cd daemon && cargo build
+  --release`, which lands the binary at `daemon/target/release/daemon` —
+  matching this template's `ExecStart`). The plugin's own automatic setup
+  doesn't use this file; it generates an equivalent unit itself, pointing
+  at wherever it actually built the binary (`~/.cache/omarchy-mwb-bridge-
+  build/release/daemon`, kept outside `daemon/` so a build doesn't spam
+  Quickshell's file-watcher with the thousands of files a Rust build
+  writes).

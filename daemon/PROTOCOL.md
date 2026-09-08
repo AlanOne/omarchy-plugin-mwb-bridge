@@ -331,14 +331,13 @@ that VK maps to evdev/XKB differs by *kind* of key:
   the evdev code that key's *label* should produce, and hardcode that
   mapping — don't trust the VK's US-centric name.
 
-## Running as a persistent service
+## One environment quirk worth knowing if the systemd unit ever needs debugging
 
-`daemon.rs` runs as a systemd `--user` service — unit template in
-`systemd/mwb-omarchy-bridge.service`, install steps in `README.md` —
-auto-restarting and starting on login. `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`
-are already present in the systemd user manager's environment on this
-Omarchy/UWSM setup, so no explicit environment passing was needed in the
-unit.
+`daemon.rs` runs as a systemd `--user` service (see `../README.md` for
+install steps) with no `Environment=` lines, yet it can still reach the
+Wayland compositor — `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` are already
+present in the systemd user manager's own environment on an Omarchy/UWSM
+setup, so a plain child service inherits them for free.
 
 ## Reference: example field values from a working setup
 

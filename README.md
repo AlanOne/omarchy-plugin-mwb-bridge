@@ -29,6 +29,16 @@ user service. See **Known bugs** below for current rough edges.
   also syncs the clipboard between machines; this bridge only reimplements
   mouse/keyboard forwarding, not that part of the protocol.
 
+## Ideas for later
+
+- **Locking both machines at once.** Real Mouse Without Borders has its
+  own `LockMachine` hotkey (Windows' `settings.json`:
+  `HotKeyLockMachine` — `Ctrl+Alt+Win+L` by default). Worth figuring out
+  how to trigger an Omarchy lock (there's already a lock-screen mechanism
+  in Omarchy itself) at the same time — either the daemon reacting to a
+  Lock-type packet from Windows if one exists in the protocol, or just a
+  second, independent hotkey on this side.
+
 ## How it's put together
 
 This repo is two things in one:

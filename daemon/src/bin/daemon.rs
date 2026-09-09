@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,29 @@ use rand::RngExt;
 // since real Mouse/Keyboard forwarding already works over the connection we
 // initiate; this side only needs to complete the handshake and stay open.
 const LISTEN_PORT: u16 = 15101;
+// The separate "clipboard server" port (BASE_PORT) that file bytes travel
+// over — a distinct TCP connection from the message server above, opened
+// on demand in whichever direction a file transfer is actually happening.
+const FILE_LISTEN_PORT: u16 = 15100;
+
+// How long any single read or write may block before we give up on a
+// connection. Without this, a connection that goes silently dead (no RST,
+// no FIN — the peer just stops responding, e.g. the Windows PC sleeping,
+// a Wi-Fi hiccup, a NAT table eviction) hangs the blocking read forever
+// with no error to trigger the existing reconnect loop — confirmed this
+// happening live: the main thread sat blocked in a plain socket read
+// (`wait_woken` in /proc/<pid>/task/*/status) for 3+ hours after Windows
+// simply stopped sending anything, no crash, no reconnect attempt, control
+// just silently stopped working. A timed-out read/write returns a normal
+// I/O error, which every caller already propagates via `?` into the
+// existing "log it, sleep 3s, reconnect" handling — no new error handling
+// needed, just making sure a stall can't block forever in the first place.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn set_socket_timeouts(stream: &TcpStream) {
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+}
 
 // Standard XKB "us" layout modifier bit indices (Shift/Ctrl/Alt/Super) —
 // matches xkbcommon's default assignment for this layout. Not derived from
@@ -157,6 +181,41 @@ fn handle_keyboard(wl: &mut WaylandInput, mods: &mut ModState, vk: u32, flags: u
     wl.key(evdev_code, pressed);
 }
 
+/// Shared state between the client connection's receive loop, the file-
+/// server listener (port 15100), and the local clipboard-watcher thread —
+/// bundled together since nearly every clipboard-related function needs at
+/// least one of these. Cloning is just cloning the inner `Arc`s.
+#[derive(Clone)]
+struct ClipboardShared {
+    // Text most recently applied from Windows, so the outbound watcher can
+    // recognize its own echo and not immediately bounce it right back.
+    last_applied_text: Arc<Mutex<Option<String>>>,
+    // The exact `file://...` URI most recently applied from a received
+    // file, for the same echo-prevention purpose.
+    last_applied_file_uri: Arc<Mutex<Option<String>>>,
+    // The local file (if any) currently available to serve when Windows
+    // connects to our file-server listener — set when the local clipboard
+    // watcher detects a new local file, read by that listener.
+    pending_outbound_file: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl ClipboardShared {
+    fn new() -> Self {
+        Self {
+            last_applied_text: Arc::new(Mutex::new(None)),
+            last_applied_file_uri: Arc::new(Mutex::new(None)),
+            pending_outbound_file: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// What the local clipboard-watcher thread detected and handed off to the
+/// client connection's send loop.
+enum ClipboardEvent {
+    Text(String),
+    File(PathBuf),
+}
+
 /// Windows -> Omarchy clipboard sync, small-path text only (real MWB's
 /// "big path", for clipboard payloads over ~1MB or files, uses an entirely
 /// separate socket/framing on port 15100 — not implemented here). Windows'
@@ -206,27 +265,171 @@ fn read_local_clipboard_text() -> Option<String> {
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Reads the Linux clipboard's current `text/uri-list` content (what file
+/// managers put there on copy), if any — same non-zero-exit-means-nothing
+/// convention as `read_local_clipboard_text`.
+fn read_local_clipboard_uri_list() -> Option<String> {
+    let output = Command::new("wl-paste").args(["--no-newline", "--type", "text/uri-list"]).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Decodes `%XX` percent-escapes in a `file://` URI's path portion back
+/// into raw bytes (interpreted as UTF-8) — just enough of RFC 3986 for
+/// local file paths, not a general-purpose URI decoder.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The inverse of `percent_decode`, for building a `file://` URI to hand to
+/// `wl-copy` — percent-encodes everything outside RFC 3986's unreserved set
+/// (letters/digits/`-_.~/`), which covers spaces and non-ASCII filenames.
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Parses a `text/uri-list` blob (one URI per line, `#`-prefixed lines are
+/// comments — RFC 2483) and returns the first `file://` entry's local path,
+/// percent-decoded. Real MWB's own file transfer only ever handles one file
+/// per send anyway (see PROTOCOL.md), so a multi-file selection here just
+/// takes the first and silently drops the rest, matching that limitation
+/// rather than trying to exceed it.
+fn parse_first_file_uri(uri_list: &str) -> Option<PathBuf> {
+    uri_list
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .and_then(|line| line.strip_prefix("file://"))
+        .map(|path| PathBuf::from(percent_decode(path)))
+}
+
+/// Where received files get written before being placed on the clipboard —
+/// mirrors the plugin's existing `~/.cache/omarchy-mwb-bridge-*` naming.
+fn clipboard_files_dir() -> PathBuf {
+    let home = std::env::var("HOME").expect("HOME not set");
+    PathBuf::from(home).join(".cache/omarchy-mwb-bridge-files")
+}
+
+/// Strips the `:port` suffix from `windows_ip` (stored as `"host:15101"`)
+/// to get the bare host for connecting to Windows' *other* port, 15100.
+fn windows_clipboard_host(windows_ip: &str) -> &str {
+    windows_ip.rsplit_once(':').map(|(host, _)| host).unwrap_or(windows_ip)
+}
+
+/// Applies a received file to the Linux clipboard as a `text/uri-list`
+/// entry (the standard GTK/Wayland equivalent of Windows' `CF_HDROP`), and
+/// records the URI for the same echo-prevention purpose as
+/// `apply_incoming_clipboard_text`.
+fn apply_incoming_clipboard_file(dest: &Path, last_applied_file_uri: &Arc<Mutex<Option<String>>>) {
+    let uri = format!("file://{}", percent_encode_path(&dest.to_string_lossy()));
+    let mut child = match Command::new("wl-copy").args(["--type", "text/uri-list"]).stdin(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("(clipboard: failed to launch wl-copy for file: {e})");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(uri.as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+    let _ = child.wait();
+    *last_applied_file_uri.lock().unwrap() = Some(uri);
+}
+
+/// Reads `size` real bytes from a clipboard-server connection's raw file
+/// stream, decrypting as it goes. Real MWB pads the actual transmitted
+/// byte count up to a multiple of `PACKAGE_SIZE` (32) with zero-fill after
+/// the real content (`SocketStuff.SendFileEx`) — read that full padded
+/// length (always a clean multiple of the AES block size) and truncate the
+/// decrypted result back down to `size` real bytes.
+fn read_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], size: usize) -> std::io::Result<Vec<u8>> {
+    const CHUNK: usize = 1 << 20; // matches real MWB's own NETWORK_STREAM_BUF_SIZE
+    let padded_len = size.div_ceil(32) * 32;
+    let mut decrypted = Vec::with_capacity(padded_len);
+    let mut remaining = padded_len;
+    while remaining > 0 {
+        let this_chunk = remaining.min(CHUNK);
+        let mut ct = vec![0u8; this_chunk];
+        stream.read_exact(&mut ct)?;
+        decrypted.extend_from_slice(&cipher.decrypt(chain, &ct));
+        remaining -= this_chunk;
+    }
+    decrypted.truncate(size);
+    Ok(decrypted)
+}
+
+/// The write-side counterpart of `read_padded_body`: zero-pads `data` up to
+/// a multiple of 32 bytes before encrypting and writing, matching what real
+/// MWB's own sender does (and what our own receive side above expects).
+fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], data: &[u8]) -> std::io::Result<()> {
+    const CHUNK: usize = 1 << 20;
+    let padded_len = data.len().div_ceil(32) * 32;
+    let mut padded = vec![0u8; padded_len];
+    padded[..data.len()].copy_from_slice(data);
+    for chunk in padded.chunks(CHUNK) {
+        stream.write_all(&cipher.encrypt(chain, chunk))?;
+    }
+    Ok(())
+}
+
 /// Omarchy -> Windows clipboard sync: polls the Linux clipboard (there's no
 /// simple blocking "notify me on change" primitive over `wl-clipboard`'s CLI
 /// tools, so polling is the simple option) and forwards genuinely new local
 /// content into `clip_tx` for whichever connection is currently live to pick
-/// up and send. Seeds its baseline from whatever's already on the clipboard
-/// at startup without sending it — only actual *changes* get synced, so an
-/// old clipboard entry from before the daemon started doesn't get pushed to
-/// Windows unexpectedly.
-fn run_clipboard_watcher(clip_tx: Sender<String>, last_applied: Arc<Mutex<Option<String>>>) {
-    let mut last_seen = read_local_clipboard_text();
+/// up and send. Checks for a file first each tick (prioritizing file
+/// semantics if a copy happens to offer both `text/uri-list` and
+/// `text/plain`), falling back to plain text. Seeds its baseline from
+/// whatever's already on the clipboard at startup without sending it — only
+/// actual *changes* get synced, so old clipboard content from before the
+/// daemon started doesn't get pushed to Windows unexpectedly.
+fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShared) {
+    let mut last_seen_file = read_local_clipboard_uri_list().as_deref().and_then(parse_first_file_uri);
+    let mut last_seen_text = read_local_clipboard_text();
     loop {
         std::thread::sleep(Duration::from_millis(500));
+
+        if let Some(path) = read_local_clipboard_uri_list().as_deref().and_then(parse_first_file_uri) {
+            if last_seen_file.as_ref() != Some(&path) {
+                last_seen_file = Some(path.clone());
+                let uri = format!("file://{}", percent_encode_path(&path.to_string_lossy()));
+                let is_echo = shared.last_applied_file_uri.lock().unwrap().as_deref() == Some(uri.as_str());
+                if !is_echo {
+                    let _ = clip_tx.send(ClipboardEvent::File(path));
+                }
+            }
+            continue; // a file is present — don't also fall through to the text check
+        }
+
         let Some(current) = read_local_clipboard_text() else { continue };
-        if last_seen.as_deref() == Some(current.as_str()) {
+        if last_seen_text.as_deref() == Some(current.as_str()) {
             continue;
         }
-        last_seen = Some(current.clone());
-        if last_applied.lock().unwrap().as_deref() == Some(current.as_str()) {
+        last_seen_text = Some(current.clone());
+        if shared.last_applied_text.lock().unwrap().as_deref() == Some(current.as_str()) {
             continue; // our own echo from applying Windows' clipboard moments ago
         }
-        let _ = clip_tx.send(current);
+        let _ = clip_tx.send(ClipboardEvent::Text(current));
     }
 }
 
@@ -250,8 +453,8 @@ fn run_session(
     mut wl: Option<&mut WaylandInput>,
     role: &str,
     cfg: &Config,
-    clipboard_rx: Option<&Receiver<String>>,
-    last_applied: &Arc<Mutex<Option<String>>>,
+    clipboard_rx: Option<&Receiver<ClipboardEvent>>,
+    shared: &ClipboardShared,
 ) -> std::io::Result<()> {
     let magic_number = get_24bit_hash(&cfg.security_key);
     let key = derive_key(&cfg.security_key);
@@ -295,16 +498,31 @@ fn run_session(
     loop {
         if let Some(rx) = clipboard_rx {
             let mut latest = None;
-            while let Ok(text) = rx.try_recv() {
-                latest = Some(text); // coalesce rapid successive changes to the last one
+            while let Ok(ev) = rx.try_recv() {
+                latest = Some(ev); // coalesce rapid successive changes to the last one
             }
-            if let Some(text) = latest {
-                for mut pkg in build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text) {
-                    finalize_send_buf(&mut pkg, magic_number);
-                    let ct = cipher.encrypt(&mut write_chain, &pkg);
-                    stream.write_all(&ct)?;
+            match latest {
+                Some(ClipboardEvent::Text(text)) => {
+                    for mut pkg in build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text) {
+                        finalize_send_buf(&mut pkg, magic_number);
+                        let ct = cipher.encrypt(&mut write_chain, &pkg);
+                        stream.write_all(&ct)?;
+                    }
+                    println!("[{role}] Sent clipboard text ({} chars) to peer.", text.chars().count());
                 }
-                println!("[{role}] Sent clipboard text ({} chars) to peer.", text.chars().count());
+                Some(ClipboardEvent::File(path)) => {
+                    let name = path.display();
+                    *shared.pending_outbound_file.lock().unwrap() = Some(path.clone());
+                    let mut beat = build_clipboard_beat(next_clip_id, cfg.machine_id);
+                    next_clip_id += 1;
+                    finalize_send_buf(&mut beat, magic_number);
+                    let ct = cipher.encrypt(&mut write_chain, &beat);
+                    stream.write_all(&ct)?;
+                    println!(
+                        "[{role}] Announced file {name} to peer (served if/when it connects to pull it)."
+                    );
+                }
+                None => {}
             }
         }
 
@@ -377,7 +595,9 @@ fn run_session(
             }
             PACKAGE_TYPE_CLIPBOARD_DATA_END => {
                 match clipboard_kind {
-                    Some(PACKAGE_TYPE_CLIPBOARD_TEXT) => apply_incoming_clipboard_text(&clipboard_buf, last_applied),
+                    Some(PACKAGE_TYPE_CLIPBOARD_TEXT) => {
+                        apply_incoming_clipboard_text(&clipboard_buf, &shared.last_applied_text)
+                    }
                     Some(PACKAGE_TYPE_CLIPBOARD_IMAGE) => {
                         println!("(clipboard: ignoring incoming image — text only for now)")
                     }
@@ -385,6 +605,24 @@ fn run_session(
                 }
                 clipboard_buf.clear();
                 clipboard_kind = None;
+            }
+            PACKAGE_TYPE_CLIPBOARD => {
+                // The "beat" announcing a file is available (real MWB's
+                // small "big data available" broadcast). Real MWB only
+                // auto-pulls this around its own machine-switch event; this
+                // bridge's fixed two-machine topology has no equivalent, so
+                // treat any beat as "pull immediately" instead — see
+                // PROTOCOL.md. Spawned in its own thread since a full file
+                // transfer over a fresh connection could take a while and
+                // shouldn't block this connection's own receive loop.
+                println!("[{role}] Received a file-available beat, pulling now.");
+                let cfg = cfg.clone();
+                let last_applied_file_uri = shared.last_applied_file_uri.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = pull_file_from_windows(&cfg, &last_applied_file_uri) {
+                        eprintln!("(clipboard: file pull failed: {e})");
+                    }
+                });
             }
             PACKAGE_TYPE_HI => {
                 hi_count += 1;
@@ -398,26 +636,171 @@ fn run_session(
     }
 }
 
+/// Runs the priming-block dance that starts every MWB connection (message
+/// server or clipboard server alike) — shared so the two clipboard-server
+/// functions below don't duplicate `run_session`'s own copy of this.
+fn prime_connection(stream: &mut TcpStream, cipher: &CbcState, write_chain: &mut [u8; 16], read_chain: &mut [u8; 16]) -> std::io::Result<()> {
+    let mut priming_out = [0u8; 16];
+    rand::rng().fill(&mut priming_out);
+    let ct = cipher.encrypt(write_chain, &priming_out);
+    stream.write_all(&ct)?;
+
+    let mut priming_in_ct = [0u8; 16];
+    stream.read_exact(&mut priming_in_ct)?;
+    let _ = cipher.decrypt(read_chain, &priming_in_ct);
+    Ok(())
+}
+
+/// Connects to Windows' *separate* clipboard-server socket (port 15100) to
+/// pull a file it just announced via a beat on the message server, and
+/// applies it to the local clipboard once fully received. See PROTOCOL.md's
+/// clipboard-sync section for the wire format this implements.
+fn pull_file_from_windows(cfg: &Config, last_applied_file_uri: &Arc<Mutex<Option<String>>>) -> std::io::Result<()> {
+    let addr = format!("{}:{FILE_LISTEN_PORT}", windows_clipboard_host(&cfg.windows_ip));
+    println!("[file-pull] Connecting to {addr}...");
+    let mut stream = TcpStream::connect(&addr)?;
+    set_socket_timeouts(&stream);
+
+    let magic_number = get_24bit_hash(&cfg.security_key);
+    let cipher = CbcState::new(&derive_key(&cfg.security_key));
+    let mut read_chain = derive_iv();
+    let mut write_chain = derive_iv();
+    prime_connection(&mut stream, &cipher, &mut write_chain, &mut read_chain)?;
+    println!("[file-pull] Primed.");
+
+    // We're pulling/receiving on this connection, so our handshake type is
+    // Clipboard (not ClipboardPush — that's Windows' side, since it's the
+    // one about to push the actual bytes).
+    let mut hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD, cfg.machine_id, &cfg.machine_name);
+    finalize_send_buf(&mut hs, magic_number);
+    stream.write_all(&cipher.encrypt(&mut write_chain, &hs))?;
+    println!("[file-pull] Sent our handshake, waiting for peer's...");
+
+    let mut peer_hs_ct = [0u8; PACKAGE_SIZE_EX];
+    stream.read_exact(&mut peer_hs_ct)?;
+    let peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
+    println!("[file-pull] Peer handshake: type={} src={} name={:?}", peer_hs[0], unpack_u32_le(&peer_hs, 8), String::from_utf8_lossy(&peer_hs[32..64]).trim_end());
+
+    let mut header_ct = [0u8; CLIPBOARD_FILE_HEADER_SIZE];
+    stream.read_exact(&mut header_ct)?;
+    println!("[file-pull] Read 1024-byte header.");
+    let header_pt = cipher.decrypt(&mut read_chain, &header_ct);
+    let header_arr: [u8; CLIPBOARD_FILE_HEADER_SIZE] = header_pt.try_into().unwrap();
+    let Some((size, name)) = parse_file_header(&header_arr) else {
+        eprintln!("[file-pull] Couldn't parse the file header, aborting.");
+        return Ok(());
+    };
+    // size==0 (real MWB stuffs an English error message into `name` on
+    // failure, e.g. an unsupported folder) and the 100MB cap are both
+    // "not a real file" cases, not something to write to disk.
+    if size == 0 || size > MAX_CLIPBOARD_FILE_SIZE {
+        eprintln!("[file-pull] Rejected: size={size} name={name:?} (likely a sender-side error, not a real file).");
+        return Ok(());
+    }
+
+    let body = read_padded_body(&mut stream, &cipher, &mut read_chain, size)?;
+
+    let safe_name = Path::new(&name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "received-file".to_string());
+    let dir = clipboard_files_dir();
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(&safe_name);
+    std::fs::write(&dest, &body)?; // fully flushed before the clipboard is touched below
+
+    apply_incoming_clipboard_file(&dest, last_applied_file_uri);
+    println!("[file-pull] Received {safe_name:?} ({size} bytes) from Windows -> {}", dest.display());
+    Ok(())
+}
+
+/// Serves whichever file is currently pending (see `ClipboardShared`) to a
+/// peer that just connected to our clipboard-server listener (port 15100)
+/// to pull it — the mirror image of `pull_file_from_windows`. Whether real
+/// MWB actually initiates this connection at all is genuinely uncertain
+/// (see PROTOCOL.md): its own auto-pull is gated on a "machine switched"
+/// event this bridge's topology doesn't have an equivalent of.
+fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending_file: &Arc<Mutex<Option<PathBuf>>>) -> std::io::Result<()> {
+    let magic_number = get_24bit_hash(&cfg.security_key);
+    let cipher = CbcState::new(&derive_key(&cfg.security_key));
+    let mut read_chain = derive_iv();
+    let mut write_chain = derive_iv();
+    prime_connection(&mut stream, &cipher, &mut write_chain, &mut read_chain)?;
+
+    // We're about to push the actual bytes, so our handshake type is
+    // ClipboardPush.
+    let mut hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD_PUSH, cfg.machine_id, &cfg.machine_name);
+    finalize_send_buf(&mut hs, magic_number);
+    stream.write_all(&cipher.encrypt(&mut write_chain, &hs))?;
+
+    let mut peer_hs_ct = [0u8; PACKAGE_SIZE_EX];
+    stream.read_exact(&mut peer_hs_ct)?;
+    let _peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
+
+    let Some(file_path) = pending_file.lock().unwrap().clone() else {
+        println!("[file-serve] Peer connected but no file is currently pending — sending an empty/error header.");
+        let header = build_file_header(0, "No file currently available");
+        stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
+        return Ok(());
+    };
+
+    let data = std::fs::read(&file_path)?;
+    let name = file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
+    let header = build_file_header(data.len(), &name);
+    stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
+    write_padded_body(&mut stream, &cipher, &mut write_chain, &data)?;
+    println!("[file-serve] Sent {name:?} ({} bytes) to peer.", data.len());
+    Ok(())
+}
+
+/// Listens on the clipboard-server port (15100) for Windows connecting in
+/// to pull a file we've announced. Mirrors `run_server_listener`'s shape.
+fn run_file_server_listener(cfg: Config, pending_file: Arc<Mutex<Option<PathBuf>>>) {
+    let listener = match TcpListener::bind(("0.0.0.0", FILE_LISTEN_PORT)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[file-serve] Failed to bind :{FILE_LISTEN_PORT}: {e}");
+            return;
+        }
+    };
+    println!("[file-serve] Listening on :{FILE_LISTEN_PORT} for file pulls.");
+
+    for conn in listener.incoming() {
+        match conn {
+            Ok(stream) => {
+                println!("[file-serve] Accepted connection from {:?}", stream.peer_addr());
+                set_socket_timeouts(&stream);
+                let cfg = cfg.clone();
+                let pending_file = pending_file.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = serve_file_to_peer(stream, &cfg, &pending_file) {
+                        eprintln!("[file-serve] Session ended: {e}");
+                    }
+                });
+            }
+            Err(e) => eprintln!("[file-serve] Accept error: {e}"),
+        }
+    }
+}
+
 /// Outbound leg: connects to Windows' message server and injects decoded
 /// Mouse/Keyboard into Wayland. This is the connection real input forwarding
 /// (and outbound clipboard sync) runs over.
 fn run_client(
     cfg: &Config,
     wl: &mut WaylandInput,
-    clipboard_rx: &Receiver<String>,
-    last_applied: &Arc<Mutex<Option<String>>>,
+    clipboard_rx: &Receiver<ClipboardEvent>,
+    shared: &ClipboardShared,
 ) -> std::io::Result<()> {
     println!("Connecting to {}...", cfg.windows_ip);
     config::write_status(false, "", "Connecting...");
     let stream = TcpStream::connect(&cfg.windows_ip)?;
-    run_session(stream, Some(wl), "client", cfg, Some(clipboard_rx), last_applied)
+    set_socket_timeouts(&stream);
+    run_session(stream, Some(wl), "client", cfg, Some(clipboard_rx), shared)
 }
 
 /// Inbound leg: accepts Windows' own outbound connection back to us (the
 /// reverse half of the pair it expects between two machines). Runs forever
 /// in its own thread; each accepted connection gets its own thread since
 /// nothing here touches the single-threaded Wayland event queue.
-fn run_server_listener(cfg: Config, last_applied: Arc<Mutex<Option<String>>>) {
+fn run_server_listener(cfg: Config, shared: ClipboardShared) {
     let listener = match TcpListener::bind(("0.0.0.0", LISTEN_PORT)) {
         Ok(l) => l,
         Err(e) => {
@@ -431,10 +814,11 @@ fn run_server_listener(cfg: Config, last_applied: Arc<Mutex<Option<String>>>) {
         match conn {
             Ok(stream) => {
                 println!("[server] Accepted connection from {:?}", stream.peer_addr());
+                set_socket_timeouts(&stream);
                 let cfg = cfg.clone();
-                let last_applied = last_applied.clone();
+                let shared = shared.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = run_session(stream, None, "server", &cfg, None, &last_applied) {
+                    if let Err(e) = run_session(stream, None, "server", &cfg, None, &shared) {
                         eprintln!("[server] Session ended: {e}");
                     }
                 });
@@ -465,21 +849,26 @@ fn main() {
     let mut wl = WaylandInput::new(&cfg.xkb_layout, &cfg.xkb_variant);
     println!("Wayland input ready. Entering connect/reconnect loop.");
 
-    let last_applied_from_windows: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let (clip_tx, clip_rx) = mpsc::channel::<String>();
+    let clipboard_shared = ClipboardShared::new();
+    let (clip_tx, clip_rx) = mpsc::channel::<ClipboardEvent>();
 
     {
         let cfg = cfg.clone();
-        let last_applied = last_applied_from_windows.clone();
-        std::thread::spawn(move || run_server_listener(cfg, last_applied));
+        let shared = clipboard_shared.clone();
+        std::thread::spawn(move || run_server_listener(cfg, shared));
     }
     {
-        let last_applied = last_applied_from_windows.clone();
-        std::thread::spawn(move || run_clipboard_watcher(clip_tx, last_applied));
+        let cfg = cfg.clone();
+        let pending_file = clipboard_shared.pending_outbound_file.clone();
+        std::thread::spawn(move || run_file_server_listener(cfg, pending_file));
+    }
+    {
+        let shared = clipboard_shared.clone();
+        std::thread::spawn(move || run_clipboard_watcher(clip_tx, shared));
     }
 
     loop {
-        if let Err(e) = run_client(&cfg, &mut wl, &clip_rx, &last_applied_from_windows) {
+        if let Err(e) = run_client(&cfg, &mut wl, &clip_rx, &clipboard_shared) {
             eprintln!("Connection ended: {e}. Reconnecting in 3s...");
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
         }

@@ -26,7 +26,19 @@ pub const PACKAGE_TYPE_HANDSHAKE_ACK: u8 = 127;
 pub const PACKAGE_TYPE_CLIPBOARD_DATA_END: u8 = 76;
 pub const PACKAGE_TYPE_CLIPBOARD_TEXT: u8 = 124;
 pub const PACKAGE_TYPE_CLIPBOARD_IMAGE: u8 = 125;
+// "Clipboard" in the C# enum — the small "beat" broadcast over the message
+// server announcing big data (here: a file) is available, and also the
+// handshake package type used by whichever side of the *separate*
+// port-15100 connection is pulling/receiving rather than pushing.
+pub const PACKAGE_TYPE_CLIPBOARD: u8 = 69;
+// The handshake package type used by whichever side of the port-15100
+// connection is about to push/send the actual file bytes.
+pub const PACKAGE_TYPE_CLIPBOARD_PUSH: u8 = 79;
 pub const ID_ALL: u32 = 255;
+
+// Real MWB's own cap (MAX_CLIPBOARD_FILE_SIZE_CAN_BE_SENT), enforced by the
+// sender before ever announcing a file.
+pub const MAX_CLIPBOARD_FILE_SIZE: usize = 100 * 1024 * 1024;
 
 // Small-path clipboard chunking (Clipboard.cs's DATA_SIZE): a ClipboardText/
 // ClipboardImage "big" (64-byte) package repurposes bytes 16-63 — normally
@@ -209,6 +221,67 @@ pub fn build_clipboard_text_packages(next_id: &mut u32, src_id: u32, text: &str)
     packages.push(end);
 
     packages
+}
+
+/// Builds the "Clipboard" beat package (Type=69) broadcast over the
+/// message-server connection to announce that a file is available to pull
+/// — mirrors real MWB's `SendClipboardBeat`. Real MWB only auto-pulls this
+/// around its own "machine switched" event (this bridge's fixed two-machine
+/// topology has no equivalent concept), so this repo's receiver treats any
+/// beat as "pull immediately" instead — a deliberate simplification, see
+/// PROTOCOL.md.
+pub fn build_clipboard_beat(id: u32, src_id: u32) -> [u8; PACKAGE_SIZE_EX] {
+    let mut buf = [0u8; PACKAGE_SIZE_EX];
+    buf[0] = PACKAGE_TYPE_CLIPBOARD;
+    pack_u32_le(&mut buf, 4, id);
+    pack_u32_le(&mut buf, 8, src_id);
+    pack_u32_le(&mut buf, 12, ID_ALL);
+    buf
+}
+
+/// Builds the 64-byte handshake package used on the *separate* clipboard-
+/// server connection (port 15100/`BASE_PORT`) that actual file bytes travel
+/// over — distinct from the message-server's Handshake/HandshakeAck pair.
+/// `package_type` is `PACKAGE_TYPE_CLIPBOARD` (this side is pulling/
+/// receiving) or `PACKAGE_TYPE_CLIPBOARD_PUSH` (this side is about to push/
+/// send the file). Real MWB leaves Des/Machine1-4 at zero here and only
+/// populates Src + MachineName — matched exactly.
+pub fn build_clipboard_handshake(package_type: u8, src_id: u32, machine_name: &str) -> [u8; PACKAGE_SIZE_EX] {
+    let mut buf = [0u8; PACKAGE_SIZE_EX];
+    buf[0] = package_type;
+    pack_u32_le(&mut buf, 8, src_id);
+    let name_padded = format!("{:<32}", machine_name);
+    buf[32..64].copy_from_slice(&name_padded.as_bytes()[..32]);
+    buf
+}
+
+pub const CLIPBOARD_FILE_HEADER_SIZE: usize = 1024;
+
+/// Builds the 1024-byte "{size}*{name}" header sent (through the same
+/// continuing encrypted stream, right before the file's raw bytes) on the
+/// clipboard-server connection. UTF-16LE-encoded, **null**-padded to fill
+/// the buffer (not space-padded, unlike the small-path MachineName field) —
+/// matches real MWB's framing exactly.
+pub fn build_file_header(size: usize, name: &str) -> [u8; CLIPBOARD_FILE_HEADER_SIZE] {
+    let bytes = utf16le_bytes(&format!("{size}*{name}"));
+    let mut buf = [0u8; CLIPBOARD_FILE_HEADER_SIZE];
+    let n = bytes.len().min(CLIPBOARD_FILE_HEADER_SIZE);
+    buf[..n].copy_from_slice(&bytes[..n]);
+    buf
+}
+
+/// Parses a file-transfer header back into `(size, name)`. Returns `None`
+/// if there's no `*`-separated numeric size prefix at all; callers should
+/// *also* treat a successfully-parsed `size == 0` as "no real file" — real
+/// MWB stuffs an English error message into this same header shape on
+/// failure (e.g. `"0*<path> - Folder is not supported, zip it first!"`)
+/// rather than using a distinct error package type.
+pub fn parse_file_header(buf: &[u8; CLIPBOARD_FILE_HEADER_SIZE]) -> Option<(usize, String)> {
+    let utf16: Vec<u16> = buf.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+    let end = utf16.iter().position(|&u| u == 0).unwrap_or(utf16.len());
+    let s = String::from_utf16_lossy(&utf16[..end]);
+    let (size_str, name) = s.split_once('*')?;
+    Some((size_str.parse().ok()?, name.to_string()))
 }
 
 /// SocketStuff.TcpSendData's checksum+magic packing, applied to the first

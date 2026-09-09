@@ -57,6 +57,26 @@ pub fn vk_to_evdev(vk: u32) -> Option<u32> {
         0x75 => 64, 0x76 => 65, 0x77 => 66, 0x78 => 67, 0x79 => 68,
         0x7A => 87, 0x7B => 88,
 
+        // Numpad. Windows reports these as their own dedicated VK codes
+        // regardless of Num Lock state (unlike the main-block digit keys),
+        // so no layout-dependent translation is needed here.
+        0x60 => 82, // VK_NUMPAD0
+        0x61 => 79, // VK_NUMPAD1
+        0x62 => 80, // VK_NUMPAD2
+        0x63 => 81, // VK_NUMPAD3
+        0x64 => 75, // VK_NUMPAD4
+        0x65 => 76, // VK_NUMPAD5
+        0x66 => 77, // VK_NUMPAD6
+        0x67 => 71, // VK_NUMPAD7
+        0x68 => 72, // VK_NUMPAD8
+        0x69 => 73, // VK_NUMPAD9
+        0x6A => 55, // VK_MULTIPLY
+        0x6B => 78, // VK_ADD
+        0x6D => 74, // VK_SUBTRACT
+        0x6E => 83, // VK_DECIMAL
+        0x6F => 98, // VK_DIVIDE (extended key; the main "/" key is VK_OEM_2)
+        0x90 => 69, // VK_NUMLOCK
+
         // Common OEM/punctuation keys (US layout)
         0xBA => 39, // VK_OEM_1 ; :
         0xBB => 13, // VK_OEM_PLUS = +

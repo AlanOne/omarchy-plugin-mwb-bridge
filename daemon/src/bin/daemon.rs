@@ -29,6 +29,15 @@ const MOD_SHIFT: u32 = 1 << 0;
 const MOD_CTRL: u32 = 1 << 2;
 const MOD_ALT: u32 = 1 << 3;
 const MOD_SUPER: u32 = 1 << 6;
+// Mod5 / "Level3Shift" — what layouts using xkeyboard-config's
+// `level3(ralt_switch)` (which ours does, via Right Alt) bind AltGr to. This
+// is a distinct real modifier from Alt/Mod1: layouts with AltGr-level
+// characters (e.g. this Slovenian layout's `<`/`>` on the comma/period keys)
+// only resolve to level 3 when this bit is set, not MOD_ALT.
+const MOD_LEVEL3: u32 = 1 << 7;
+// Mod2 — XKB's conventional NumLock lock-modifier.
+const LOCK_NUMLOCK: u32 = 1 << 4;
+const VK_NUMLOCK: u32 = 0x90;
 
 // Win32 WM_* message constants carried in Mouse/Keyboard dwFlags fields.
 const WM_MOUSEMOVE: u32 = 0x0200;
@@ -61,7 +70,18 @@ impl ModState {
         let bit = match vk {
             0x10 | 0xA0 | 0xA1 => MOD_SHIFT,
             0x11 | 0xA2 | 0xA3 => MOD_CTRL,
-            0x12 | 0xA4 | 0xA5 => MOD_ALT,
+            0x12 | 0xA4 => MOD_ALT,
+            // VK_RMENU: Windows reports AltGr as a synthetic VK_LCONTROL
+            // down/up pair immediately around the real VK_RMENU (verified
+            // empirically — every AltGr press logs 0xA2 then 0xA5, in that
+            // order, on both press and release). Forwarding that fake Ctrl
+            // as MOD_CTRL and this key as MOD_ALT never reaches level 3 —
+            // clear the fake Ctrl bit and use MOD_LEVEL3 instead, matching
+            // what `level3(ralt_switch)` actually binds Right Alt to.
+            0xA5 => {
+                self.depressed &= !MOD_CTRL;
+                MOD_LEVEL3
+            }
             0x5B | 0x5C => MOD_SUPER,
             _ => return false,
         };
@@ -97,6 +117,18 @@ fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32) {
 }
 
 fn handle_keyboard(wl: &mut WaylandInput, mods: &mut ModState, vk: u32, flags: u32) {
+    // Windows' own NumLock state and this machine's are two independent,
+    // unsynchronized locks. Forwarding the raw NumLock keypress toggles our
+    // side's lock-state via the compositor's own keymap-driven handling —
+    // if the two ever disagree, numpad digit keys silently become
+    // navigation keys (Home/End/arrows/etc.) instead, since which one a
+    // numpad key produces depends entirely on the *receiving* side's
+    // NumLock state. Numpad keys below force NumLock-locked on every press
+    // instead, so this never needs tracking or toggling at all.
+    if vk == VK_NUMLOCK {
+        return;
+    }
+
     let pressed = (flags & LLKHF_UP) == 0;
     let is_mod = mods.update(vk, pressed);
     let Some(evdev_code) = vk_to_evdev(vk) else {
@@ -105,6 +137,8 @@ fn handle_keyboard(wl: &mut WaylandInput, mods: &mut ModState, vk: u32, flags: u
     };
     if is_mod {
         wl.modifiers(mods.depressed, 0, 0, 0);
+    } else if (0x60..=0x6F).contains(&vk) {
+        wl.modifiers(mods.depressed, 0, LOCK_NUMLOCK, 0);
     }
     wl.key(evdev_code, pressed);
 }

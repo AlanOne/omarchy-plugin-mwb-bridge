@@ -96,7 +96,17 @@ impl ModState {
 
 fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32) {
     match flags {
-        WM_MOUSEMOVE => wl.move_absolute(m1, m2, 65535, 65535),
+        WM_MOUSEMOVE => {
+            // Observed in real traffic (likely an edge-crossing overshoot):
+            // an occasional out-of-range value that's actually small and
+            // negative, wrapping to a huge u32 (e.g. 4294967271 = -25 as
+            // i32) when read as one. Clamp back into the valid 0..=65535
+            // absolute-coordinate range rather than forwarding it verbatim,
+            // which would otherwise send the cursor somewhere nonsensical.
+            let x = (m1 as i32).clamp(0, 65535) as u32;
+            let y = (m2 as i32).clamp(0, 65535) as u32;
+            wl.move_absolute(x, y, 65535, 65535)
+        }
         WM_LBUTTONDOWN => wl.button(BTN_LEFT, true),
         WM_LBUTTONUP => wl.button(BTN_LEFT, false),
         WM_RBUTTONDOWN => wl.button(BTN_RIGHT, true),

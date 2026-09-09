@@ -23,6 +23,19 @@ pub const PACKAGE_TYPE_KEYBOARD: u8 = 122;
 pub const PACKAGE_TYPE_MOUSE: u8 = 123;
 pub const PACKAGE_TYPE_HANDSHAKE: u8 = 126;
 pub const PACKAGE_TYPE_HANDSHAKE_ACK: u8 = 127;
+// "You're now the active machine" — this is what actually gates real MWB's
+// own file/big-clipboard auto-pull (Receiver.cs's MachineSwitched case),
+// not the Clipboard beat itself. A plain 32-byte package (not in the
+// is_big_package list), Des = the machine being told it's now active.
+// Confirmed harmless to synthesize: its handler only checks timing against
+// the last beat and re-triggers a pull — no state it touches is shared
+// with Mouse/Keyboard forwarding. See PROTOCOL.md.
+pub const PACKAGE_TYPE_MACHINE_SWITCHED: u8 = 77;
+// Sent immediately before MachineSwitched in every *real* switch this repo
+// has captured live from Windows (Ctrl+Alt+F1-style) — presumably just a
+// cursor-visibility toggle for the switch UX, but included here to exactly
+// mirror the real sequence rather than a synthesized subset of it.
+pub const PACKAGE_TYPE_HIDE_MOUSE: u8 = 50;
 pub const PACKAGE_TYPE_CLIPBOARD_DATA_END: u8 = 76;
 pub const PACKAGE_TYPE_CLIPBOARD_TEXT: u8 = 124;
 pub const PACKAGE_TYPE_CLIPBOARD_IMAGE: u8 = 125;
@@ -264,6 +277,31 @@ pub fn build_clipboard_beat(id: u32, src_id: u32) -> [u8; PACKAGE_SIZE_EX] {
     pack_u32_le(&mut buf, 4, id);
     pack_u32_le(&mut buf, 8, src_id);
     pack_u32_le(&mut buf, 12, ID_ALL);
+    buf
+}
+
+/// Builds the "MachineSwitched" package (Type=77) that actually triggers
+/// real MWB's file/big-clipboard auto-pull — a plain 32-byte package
+/// (unlike the beat above, `Des` here is the specific machine being told
+/// it's now active, not a broadcast). Must arrive within 30s of a
+/// `Clipboard` beat to have any effect (`BIG_CLIPBOARD_DATA_TIMEOUT`) —
+/// send it right after the beat, same as this repo already does.
+pub fn build_machine_switched(id: u32, src_id: u32, des_id: u32) -> [u8; PACKAGE_SIZE] {
+    let mut buf = [0u8; PACKAGE_SIZE];
+    buf[0] = PACKAGE_TYPE_MACHINE_SWITCHED;
+    pack_u32_le(&mut buf, 4, id);
+    pack_u32_le(&mut buf, 8, src_id);
+    pack_u32_le(&mut buf, 12, des_id);
+    buf
+}
+
+/// Builds a HideMouse package (Type=50) — see its constant doc comment.
+pub fn build_hide_mouse(id: u32, src_id: u32, des_id: u32) -> [u8; PACKAGE_SIZE] {
+    let mut buf = [0u8; PACKAGE_SIZE];
+    buf[0] = PACKAGE_TYPE_HIDE_MOUSE;
+    pack_u32_le(&mut buf, 4, id);
+    pack_u32_le(&mut buf, 8, src_id);
+    pack_u32_le(&mut buf, 12, des_id);
     buf
 }
 

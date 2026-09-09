@@ -43,7 +43,18 @@ const FILE_LISTEN_PORT: u16 = 15100;
 // I/O error, which every caller already propagates via `?` into the
 // existing "log it, sleep 3s, reconnect" handling — no new error handling
 // needed, just making sure a stall can't block forever in the first place.
-const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+//
+// Originally 30s, raised to 5 minutes after confirming *that* value was
+// too aggressive: real MWB apparently doesn't keep an idle connection
+// "hot" with any periodic keepalive-style packet independent of actual
+// activity — confirmed live, a genuinely healthy connection with nobody
+// touching the Windows mouse/keyboard went quiet for 30-70s at a time,
+// repeatedly, causing an unwanted reconnect (and a few seconds of KVM
+// downtime) roughly every minute during normal idle use. 5 minutes still
+// recovers *far* faster than the original no-timeout-at-all hang, while
+// being generous enough to essentially never fire during legitimate idle
+// gaps between actual use.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn set_socket_timeouts(stream: &TcpStream) {
     let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
@@ -253,6 +264,13 @@ struct ClipboardShared {
     // sends inline and never touches this) — set when the local clipboard
     // watcher detects new local big-path content, read by that listener.
     pending_outbound: Arc<Mutex<Option<PendingOutbound>>>,
+    // Windows' own machine ID, learned from the Src field of anything it's
+    // sent us — needed to address a MachineSwitched package directly to
+    // it. Persisted here (not just a per-connection local) so a reconnect
+    // doesn't forget it and go a full round without being able to send
+    // MachineSwitched — it's the same physical Windows install and this
+    // essentially never changes short of a PowerToys reset.
+    peer_machine_id: Arc<Mutex<Option<u32>>>,
 }
 
 impl ClipboardShared {
@@ -262,6 +280,7 @@ impl ClipboardShared {
             last_applied_file_uri: Arc::new(Mutex::new(None)),
             last_applied_image: Arc::new(Mutex::new(None)),
             pending_outbound: Arc::new(Mutex::new(None)),
+            peer_machine_id: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -586,6 +605,58 @@ fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShare
     }
 }
 
+/// Announces big-path content (a file or a big clipboard image) to the
+/// peer: the `Clipboard` beat, then — if we've learned the peer's machine
+/// ID from something it's sent us already — a follow-up `MachineSwitched`
+/// package addressed directly to it. Real MWB's own auto-pull is gated on
+/// `MachineSwitched`, not the beat alone (see PROTOCOL.md); without this
+/// follow-up, a real PowerToys install never actually connects to fetch
+/// what we've announced.
+///
+/// **Both packages need a genuinely fresh, never-before-used `Id`, not
+/// just one that's unique within this connection.** Windows' own receive
+/// dispatcher (`Receiver.PreProcess`) keeps a 50-slot ring buffer of
+/// recently-seen `Id` values that persists for the life of the Windows
+/// process, silently dropping (no log, no error, switch statement never
+/// runs) any repeat — every package type is subject to this *except*
+/// `ClipboardText`/`ClipboardImage`/`Handshake`/`HandshakeAck`, which are
+/// explicitly exempted. `Clipboard`/`MachineSwitched` are not exempted.
+/// Confirmed live: a per-connection counter starting at a fixed value
+/// resends the exact same `Id` on every reconnect, which Windows
+/// remembers forever (nothing else ever evicts those two slots since nothing
+/// else non-exempt is ever sent) — every attempt after the first was
+/// silently deduped this way. Random IDs make a repeat astronomically
+/// unlikely regardless of how many times this daemon restarts.
+fn announce_big_path(
+    stream: &mut TcpStream,
+    cipher: &CbcState,
+    write_chain: &mut [u8; 16],
+    magic_number: u32,
+    src_id: u32,
+    peer_machine_id: Option<u32>,
+) -> std::io::Result<()> {
+    let mut beat = build_clipboard_beat(rand::rng().random(), src_id);
+    finalize_send_buf(&mut beat, magic_number);
+    stream.write_all(&cipher.encrypt(write_chain, &beat))?;
+
+    if let Some(des_id) = peer_machine_id {
+        // Mirror the exact real sequence captured live from Windows'
+        // own Ctrl+Alt+F1-style switch: HideMouse immediately before
+        // MachineSwitched, both addressed to the newly-active machine —
+        // not just the isolated MachineSwitched case-block in source.
+        let mut hide = build_hide_mouse(rand::rng().random(), src_id, des_id);
+        finalize_send_buf(&mut hide, magic_number);
+        stream.write_all(&cipher.encrypt(write_chain, &hide))?;
+
+        let mut switched = build_machine_switched(rand::rng().random(), src_id, des_id);
+        finalize_send_buf(&mut switched, magic_number);
+        stream.write_all(&cipher.encrypt(write_chain, &switched))?;
+    } else {
+        eprintln!("(clipboard: haven't learned the peer's machine ID yet, skipping MachineSwitched — beat sent alone, may not trigger a real pull)");
+    }
+    Ok(())
+}
+
 /// Runs one connection's lifecycle over an already-connected/accepted
 /// stream: prime, handshake, then receive forever until the socket errors or
 /// closes. Shared by both the outbound client connection (which injects
@@ -676,22 +747,14 @@ fn run_session(
                 Some(ClipboardEvent::File(path)) => {
                     let name = path.display();
                     *shared.pending_outbound.lock().unwrap() = Some(PendingOutbound::File(path.clone()));
-                    let mut beat = build_clipboard_beat(next_clip_id, cfg.machine_id);
-                    next_clip_id += 1;
-                    finalize_send_buf(&mut beat, magic_number);
-                    let ct = cipher.encrypt(&mut write_chain, &beat);
-                    stream.write_all(&ct)?;
+                    announce_big_path(&mut stream, &cipher, &mut write_chain, magic_number, cfg.machine_id, *shared.peer_machine_id.lock().unwrap())?;
                     println!(
                         "[{role}] Announced file {name} to peer (served if/when it connects to pull it)."
                     );
                 }
                 Some(ClipboardEvent::BigImage(path)) => {
                     *shared.pending_outbound.lock().unwrap() = Some(PendingOutbound::Image(path));
-                    let mut beat = build_clipboard_beat(next_clip_id, cfg.machine_id);
-                    next_clip_id += 1;
-                    finalize_send_buf(&mut beat, magic_number);
-                    let ct = cipher.encrypt(&mut write_chain, &beat);
-                    stream.write_all(&ct)?;
+                    announce_big_path(&mut stream, &cipher, &mut write_chain, magic_number, cfg.machine_id, *shared.peer_machine_id.lock().unwrap())?;
                     println!(
                         "[{role}] Announced a big clipboard image to peer (served if/when it connects to pull it)."
                     );
@@ -715,6 +778,10 @@ fn run_session(
         }
         if !valid {
             continue;
+        }
+        let src_id = unpack_u32_le(&full, 8);
+        if src_id != 0 && src_id != ID_ALL {
+            *shared.peer_machine_id.lock().unwrap() = Some(src_id);
         }
 
         match package_type {
@@ -815,7 +882,7 @@ fn run_session(
                     println!("[{role}] (Hi liveness pings received so far: {hi_count})");
                 }
             }
-            PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT => {}
+            PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT | PACKAGE_TYPE_MACHINE_SWITCHED => {}
             _ => {}
         }
     }

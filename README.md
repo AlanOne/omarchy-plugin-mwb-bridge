@@ -172,6 +172,18 @@ The daemon also writes live connection status to
 `~/.local/share/omarchy-mwb-bridge/status.json` (`{connected, peer, detail,
 updated_epoch}`) — this is what the bar widget polls for display.
 
+## Reboots
+
+The daemon auto-starts and reconnects to Windows with no interaction needed
+on a reboot — confirmed via a real reboot's boot log: it started, handshook,
+and was forwarding real packets within about 10 seconds of its systemd unit
+firing. The one thing that still needs a human at the machine is anything
+that has to happen *before* a graphical session exists at all — most
+commonly a full-disk-encryption passphrase prompt, if your install uses one
+(this one does), which looks similar to a login screen but is unrelated to
+it and can't be bypassed by SDDM autologin or anything else software-side.
+Past that point, everything is automatic.
+
 ## Layout
 
 - `manifest.json`, `BarWidget.qml` — the Omarchy plugin (repo root, so it

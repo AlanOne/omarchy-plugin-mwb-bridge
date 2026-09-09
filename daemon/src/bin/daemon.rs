@@ -336,6 +336,17 @@ fn windows_clipboard_host(windows_ip: &str) -> &str {
     windows_ip.rsplit_once(':').map(|(host, _)| host).unwrap_or(windows_ip)
 }
 
+/// Extracts the filename from a full **Windows** path (e.g.
+/// `C:\Users\Alan\Downloads\file.txt`), which the file-transfer header's
+/// `name` field always is for a normal file copy. `std::path::Path` isn't
+/// safe for this on Linux — it only recognizes `/` as a separator on this
+/// platform, so `Path::new(windows_path).file_name()` returns the *entire*
+/// backslash-laden string as one component (confirmed live: a received
+/// file landed named literally `C:\Users\Alan\Downloads\copytest.txt`).
+fn windows_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
 /// Applies a received file to the Linux clipboard as a `text/uri-list`
 /// entry (the standard GTK/Wayland equivalent of Windows' `CF_HDROP`), and
 /// records the URI for the same echo-prevention purpose as
@@ -618,8 +629,16 @@ fn run_session(
                 println!("[{role}] Received a file-available beat, pulling now.");
                 let cfg = cfg.clone();
                 let last_applied_file_uri = shared.last_applied_file_uri.clone();
+                // Reuse this already-live connection's peer IP rather than
+                // re-resolving cfg.windows_ip's hostname independently — a
+                // fresh resolution can non-deterministically pick a
+                // different address (confirmed live: it picked an IPv6
+                // link-local address once, which Windows' clipboard-server
+                // rejected outright as "Unknown" since it only has this
+                // machine's IPv4 address on file).
+                let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
                 std::thread::spawn(move || {
-                    if let Err(e) = pull_file_from_windows(&cfg, &last_applied_file_uri) {
+                    if let Err(e) = pull_file_from_windows(&cfg, peer_ip, &last_applied_file_uri) {
                         eprintln!("(clipboard: file pull failed: {e})");
                     }
                 });
@@ -655,13 +674,28 @@ fn prime_connection(stream: &mut TcpStream, cipher: &CbcState, write_chain: &mut
 /// pull a file it just announced via a beat on the message server, and
 /// applies it to the local clipboard once fully received. See PROTOCOL.md's
 /// clipboard-sync section for the wire format this implements.
-fn pull_file_from_windows(cfg: &Config, last_applied_file_uri: &Arc<Mutex<Option<String>>>) -> std::io::Result<()> {
-    let addr = format!("{}:{FILE_LISTEN_PORT}", windows_clipboard_host(&cfg.windows_ip));
-    println!("[file-pull] Connecting to {addr}...");
-    let mut stream = TcpStream::connect(&addr)?;
+fn pull_file_from_windows(
+    cfg: &Config,
+    peer_ip: Option<std::net::IpAddr>,
+    last_applied_file_uri: &Arc<Mutex<Option<String>>>,
+) -> std::io::Result<()> {
+    let mut stream = match peer_ip {
+        Some(ip) => {
+            let addr = std::net::SocketAddr::new(ip, FILE_LISTEN_PORT);
+            println!("[file-pull] Connecting to {addr} (same IP as the live message-server connection)...");
+            TcpStream::connect(addr)?
+        }
+        None => {
+            // Fallback if we somehow couldn't read the live connection's
+            // peer address — re-resolves the configured host, which risks
+            // the IPv4-vs-IPv6 mismatch documented above.
+            let addr = format!("{}:{FILE_LISTEN_PORT}", windows_clipboard_host(&cfg.windows_ip));
+            println!("[file-pull] Connecting to {addr} (fallback: re-resolved host)...");
+            TcpStream::connect(&addr)?
+        }
+    };
     set_socket_timeouts(&stream);
 
-    let magic_number = get_24bit_hash(&cfg.security_key);
     let cipher = CbcState::new(&derive_key(&cfg.security_key));
     let mut read_chain = derive_iv();
     let mut write_chain = derive_iv();
@@ -670,9 +704,17 @@ fn pull_file_from_windows(cfg: &Config, last_applied_file_uri: &Arc<Mutex<Option
 
     // We're pulling/receiving on this connection, so our handshake type is
     // Clipboard (not ClipboardPush — that's Windows' side, since it's the
-    // one about to push the actual bytes).
-    let mut hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD, cfg.machine_id, &cfg.machine_name);
-    finalize_send_buf(&mut hs, magic_number);
+    // one about to push the actual bytes). Unlike the message-server's
+    // Handshake/HandshakeAck, this handshake has no checksum/magic-number
+    // scheme at all — `Type` marshals as a full 4-byte little-endian int on
+    // the C# side (confirmed: `Id` sits at FieldOffset(sizeof(PackageType))
+    // == 4), so calling `finalize_send_buf` here would write checksum bytes
+    // into what Windows reads as the upper 24 bits of the *same* Type
+    // field, corrupting it into a value matching neither Clipboard nor
+    // ClipboardPush — confirmed live: this is exactly what was producing
+    // Windows' "Clipboard connection rejected: Unknown" toast. Send the
+    // raw handshake bytes unmodified.
+    let hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD, cfg.machine_id, &cfg.machine_name);
     stream.write_all(&cipher.encrypt(&mut write_chain, &hs))?;
     println!("[file-pull] Sent our handshake, waiting for peer's...");
 
@@ -700,7 +742,7 @@ fn pull_file_from_windows(cfg: &Config, last_applied_file_uri: &Arc<Mutex<Option
 
     let body = read_padded_body(&mut stream, &cipher, &mut read_chain, size)?;
 
-    let safe_name = Path::new(&name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "received-file".to_string());
+    let safe_name = windows_basename(&name);
     let dir = clipboard_files_dir();
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(&safe_name);
@@ -718,16 +760,15 @@ fn pull_file_from_windows(cfg: &Config, last_applied_file_uri: &Arc<Mutex<Option
 /// (see PROTOCOL.md): its own auto-pull is gated on a "machine switched"
 /// event this bridge's topology doesn't have an equivalent of.
 fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending_file: &Arc<Mutex<Option<PathBuf>>>) -> std::io::Result<()> {
-    let magic_number = get_24bit_hash(&cfg.security_key);
     let cipher = CbcState::new(&derive_key(&cfg.security_key));
     let mut read_chain = derive_iv();
     let mut write_chain = derive_iv();
     prime_connection(&mut stream, &cipher, &mut write_chain, &mut read_chain)?;
 
     // We're about to push the actual bytes, so our handshake type is
-    // ClipboardPush.
-    let mut hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD_PUSH, cfg.machine_id, &cfg.machine_name);
-    finalize_send_buf(&mut hs, magic_number);
+    // ClipboardPush. No finalize_send_buf here — see the comment in
+    // pull_file_from_windows on why this handshake has no checksum scheme.
+    let hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD_PUSH, cfg.machine_id, &cfg.machine_name);
     stream.write_all(&cipher.encrypt(&mut write_chain, &hs))?;
 
     let mut peer_hs_ct = [0u8; PACKAGE_SIZE_EX];

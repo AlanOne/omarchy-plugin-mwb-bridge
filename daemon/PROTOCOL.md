@@ -200,6 +200,60 @@ every packet**, not just the first one.
   copying a file on Windows lands as a real, pasteable clipboard entry
   here. The reverse direction is a confirmed architectural dead end
   against a real, unmodified PowerToys install, not a bug — see below.
+- **Locking both machines** via MWB's own `HotKeyLockMachine` double-tap
+  (see below) — no new packet type, just recognizing a distinctively fast
+  Keyboard-packet burst.
+
+## Locking both machines (`HotKeyLockMachine`)
+
+Real MWB's own lock-both-machines feature, confirmed from source
+(`InputHook.cs:539-575`) and live-tested end-to-end. A **single** press of
+the configured combo (`Setting.Values.HotKeyLockMachine`, default
+`Ctrl+Alt+Win+L`) just forwards normally — no lock, no broadcast. A
+**double-tap** (within 500ms) does this instead:
+
+```
+MachineStuff.SwitchToMultipleMode(true, true);  // Des = ID.ALL for what follows
+foreach key in combo: KeyboardEvent(key, down)  // all down, back-to-back
+foreach key in combo: KeyboardEvent(key, up)    // all up, back-to-back
+MachineStuff.SwitchToMultipleMode(false, true);
+LockWorkStation();                              // then locks itself
+```
+
+`KeyboardEvent` is the *exact same function* that sends real forwarded
+keystrokes as ordinary `PackageType.Keyboard` packets — there's no
+dedicated lock packet type at all (the full enum was re-checked; nothing
+was missed). The distinguishing feature is timing: this synthetic burst
+has near-zero gaps between each key, something no natural chord press can
+produce (a human pressing even a 2-key combo has real, non-zero timing
+between the keys). The physical keystrokes of the double-tap itself never
+reach the wire at all — `ProcessHotKeys` returns `false` for the hotkey
+match, meaning Windows' global low-level hook consumes them before the
+normal per-key forwarding path ever sees them; only the synthetic burst
+above is what actually arrives.
+
+This repo's `LockComboDetector` (`daemon.rs`) watches the last few Keyboard
+packets' `(vk, pressed, arrival-time)` and fires once it's seen `Win`-down,
+`L`-down, `Win`-up, and `L`-up all within a 150ms window, running
+`omarchy-system-lock` (the same command Omarchy's own idle-service uses)
+when it does. Deliberately checks only for `Win`+`L` being present, not the
+full configured combo — matches whatever `HotKeyLockMachine` actually is as
+long as it includes those two, without needing to know the exact value.
+
+**Windows' own native `Win+L` cannot be used for this at all — confirmed by
+testing it directly.** A genuine rapid double-press of `Win+L` produced
+*zero* signal: no Keyboard packets for either key showed up on the wire.
+`Win+L` is a Windows-reserved shortcut handled by the OS almost instantly,
+before any third-party low-level hook (PowerToys' included) gets a chance
+to register a second press within the window — the machine is already
+locked by the time a "double-tap" could even be counted. `MWB` has zero
+other awareness of the local machine's lock state (no
+`SessionSwitch`/`WTSRegisterSessionNotification` anywhere in the module) —
+this hotkey path is the *only* signal it ever produces, so there's no
+other way to detect a `Win+L`-configured lock. Setting
+`HotKeyLockMachine` to anything else PowerToys doesn't share with the OS
+(`Ctrl+Alt+Win+L`, the classic default, confirmed working) sidesteps this
+entirely, since PowerToys' own hook can then fully own the combo.
 
 ## Clipboard sync
 

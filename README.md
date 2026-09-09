@@ -11,7 +11,8 @@ Hyprland because `xdg-desktop-portal-hyprland` doesn't implement the
 **Status: working end-to-end.** Mouse (movement, clicks, scroll) and
 keyboard both forward, via either edge-crossing or the `Ctrl+Alt+F1`-style
 hotkey switch, plain-text clipboard content syncs both ways automatically,
-copying a file on Windows makes it pasteable here too, and it runs as an
+copying a file on Windows makes it pasteable here too, double-tapping
+Windows' own lock hotkey locks this machine too, and it runs as an
 auto-starting, auto-reconnecting systemd user service. See **Known bugs**
 below for current rough edges.
 
@@ -38,13 +39,6 @@ below for current rough edges.
 
 ## Ideas for later
 
-- **Locking both machines at once.** Real Mouse Without Borders has its
-  own `LockMachine` hotkey (Windows' `settings.json`:
-  `HotKeyLockMachine` — `Ctrl+Alt+Win+L` by default). Worth figuring out
-  how to trigger an Omarchy lock (there's already a lock-screen mechanism
-  in Omarchy itself) at the same time — either the daemon reacting to a
-  Lock-type packet from Windows if one exists in the protocol, or just a
-  second, independent hotkey on this side.
 - **Clipboard images.** Not implemented, text/files only for now — see
   `daemon/PROTOCOL.md`'s clipboard section for why it's a separable,
   independently-addable code path whenever it's worth doing.
@@ -107,6 +101,26 @@ to Windows, but a real PowerToys install won't actually come fetch it — see
 (matches a real limitation of Mouse Without Borders' own file-transfer
 code, not something narrowed further here) — only the first file of a
 multi-file selection is used, the rest silently ignored.
+
+## Locking both machines
+
+Double-tapping Mouse Without Borders' own lock hotkey (in PowerToys'
+settings, `HotKeyLockMachine` — not Windows' native `Win+L`, see below) on
+Windows locks this machine too, within about half a second. Real MWB sends
+that combo's own keys as an ordinary, very fast Keyboard-packet burst (all
+down, then all up) right before locking itself — this bridge watches for
+that unnaturally-fast timing and runs `omarchy-system-lock` in response, no
+new packet type involved.
+
+**Windows' native `Win+L` won't work for this, and can't be made to** — it's
+a Windows-reserved shortcut handled by the OS almost instantly, before
+PowerToys' own hook gets a chance to register a second press within the
+double-tap window. If your `HotKeyLockMachine` is currently set to `Win+L`,
+change it in PowerToys' Mouse Without Borders settings to something Windows
+doesn't already reserve — the classic default, `Ctrl+Alt+Win+L`, works.
+Confirmed live: the detection only checks that `Win` and `L` both appear
+(down and up) within the burst, not the full combo, so it doesn't matter
+if your configured combo adds other modifiers on top of those two.
 
 ## Install
 

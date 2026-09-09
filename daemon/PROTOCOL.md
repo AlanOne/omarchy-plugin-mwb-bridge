@@ -195,7 +195,11 @@ every packet**, not just the first one.
   end-to-end: cursor movement, clicks, scroll wheel, and typing (including
   modifier keys) all land correctly on the Linux side. See below for what
   it actually took to get here — none of it was in the wire protocol.
-- **Clipboard sync, both directions, text only** (small-path, see below).
+- **Clipboard sync, both directions, text and images, both size paths**
+  (see below) — plain text and clipboard images (screenshots, "copy image"
+  with no file involved) both sync automatically either direction, small
+  ones inline and larger ones (screenshots routinely exceed the small-path
+  threshold) over the big-path connection.
 - **File copy/paste, Windows -> Omarchy only** (big-path, see below) —
   copying a file on Windows lands as a real, pasteable clipboard entry
   here. The reverse direction is a confirmed architectural dead end
@@ -366,8 +370,39 @@ later chunks as duplicates of the first.
   purpose without needing an explicit timer.
 - Image handling is a fully separate, independently-switchable code path on
   the sender (same chunking, but `Type = ClipboardImage`, raw bytes, no
-  compression, no text-format tagging) — confirmed safe to implement text now
-  and images later without touching this logic, if ever needed.
+  compression, no text-format tagging) — confirmed safe to implement text
+  first and images later without touching this logic (and later actually
+  done that way — see below).
+
+### Clipboard images: simpler than text, but routinely needs the big path too
+
+Confirmed from source (`Clipboard.cs`'s `CheckClipboardEx`): the wire
+payload for `ClipboardImage` is `Clipboard.GetImage()`'s bytes re-encoded
+via `image.Save(stream, ImageFormat.Png)` — **a plain, complete PNG file,
+verbatim, no tag/SEP wrapper and no compression** (GDI+'s PNG encoding is
+already compressed; layering DEFLATE on top the way text does would just
+waste time for no size benefit). Receipt is equally direct:
+`Image.FromStream(stream)` followed by `Clipboard.SetImage(image)` — no
+custom parsing. This repo's `apply_incoming_clipboard_image`/outbound send
+path mirrors this exactly: pipe the accumulated/read bytes straight to/from
+`wl-copy`/`wl-paste --type image/png`, no encode or decode step at all.
+
+**The same size split applies as text, using the identical size check** —
+`CheckClipboardEx` builds the PNG bytes first, *then* runs the same
+`byteData.Length < MAX_CLIPBOARD_DATA_SIZE_CAN_BE_SENT_INSTANTLY_TCP`
+(1MB) test used for text, with no image-specific threshold. Real
+screenshots routinely exceed 1MB at normal resolution, so a small-path-only
+implementation would work for tiny crops and silently do nothing for a
+typical full-screen capture — this repo wires images into **both** paths:
+small (the existing `ClipboardText`-style chunking, generalized into a
+shared `build_clipboard_chunk_packages` helper in `mwb_protocol.rs`) and
+big (the existing file-transfer connection, reused by tagging the
+1024-byte header's `name` field with the literal string `"image"` — the
+exact placeholder real MWB itself sends in this case instead of a real
+filename — which this repo's receive side checks for to decide "apply as
+image bytes" instead of "write to a named file"). Verified end-to-end,
+both directions, both paths, including a 2MB screenshot correctly landing
+via the big path as real image bytes on the clipboard, not a stray file.
 
 ### Big path (file transfer): what's implemented, and two real bugs found live
 

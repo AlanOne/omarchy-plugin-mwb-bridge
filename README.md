@@ -10,11 +10,11 @@ Hyprland because `xdg-desktop-portal-hyprland` doesn't implement the
 
 **Status: working end-to-end.** Mouse (movement, clicks, scroll) and
 keyboard both forward, via either edge-crossing or the `Ctrl+Alt+F1`-style
-hotkey switch, plain-text clipboard content syncs both ways automatically,
-copying a file on Windows makes it pasteable here too, double-tapping
-Windows' own lock hotkey locks this machine too, and it runs as an
-auto-starting, auto-reconnecting systemd user service. See **Known bugs**
-below for current rough edges.
+hotkey switch, plain-text and image clipboard content syncs both ways
+automatically, copying a file on Windows makes it pasteable here too,
+double-tapping Windows' own lock hotkey locks this machine too, and it runs
+as an auto-starting, auto-reconnecting systemd user service. See **Known
+bugs** below for current rough edges.
 
 ## Known bugs
 
@@ -39,9 +39,6 @@ below for current rough edges.
 
 ## Ideas for later
 
-- **Clipboard images.** Not implemented, text/files only for now — see
-  `daemon/PROTOCOL.md`'s clipboard section for why it's a separable,
-  independently-addable code path whenever it's worth doing.
 - **File copy/paste back to Windows** (Omarchy -> Windows direction).
   Copying a file here does get announced to Windows correctly, but a real,
   unmodified PowerToys install's own file-pull only ever triggers on its
@@ -81,13 +78,16 @@ supervises over `systemctl` and a couple of JSON files.
 
 ## Clipboard
 
-Plain text syncs both ways automatically — copy on Windows and it's applied
-to this machine's clipboard (via `wl-copy`), copy here and it's sent to
-Windows (detected by polling `wl-paste` every 500ms; both need
-`wl-clipboard` installed, which is standard on Omarchy). Applying one
-side's copy to the other doesn't bounce straight back — each side tracks
-what it just applied from its peer and skips re-sending an exact echo of
-it. See **Ideas for later** above for what's not covered yet (images).
+Plain text and images both sync both ways automatically — copy on Windows
+and it's applied to this machine's clipboard (via `wl-copy`), copy here and
+it's sent to Windows (detected by polling `wl-paste` every 500ms; both need
+`wl-clipboard` installed, which is standard on Omarchy). A screenshot or
+"copy image" (no file involved) works the same way as text — a small image
+sends inline, a larger one (screenshots routinely exceed the small-path
+size limit) is announced and pulled over the same connection file transfer
+uses. Applying one side's copy to the other doesn't bounce straight back —
+each side tracks what it just applied from its peer and skips re-sending an
+exact echo of it.
 
 ## Files
 

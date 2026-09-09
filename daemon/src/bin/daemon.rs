@@ -434,6 +434,23 @@ fn windows_clipboard_host(windows_ip: &str) -> &str {
     windows_ip.rsplit_once(':').map(|(host, _)| host).unwrap_or(windows_ip)
 }
 
+/// Returns `addr` with its port changed, preserving an IPv6 address's scope
+/// ID and flow info if present. Plain `SocketAddr::new(addr.ip(), port)`
+/// silently drops the scope ID — fine for a global IPv6/IPv4 address, but
+/// breaks a link-local one (`fe80::...`), which needs it to be routable at
+/// all. Confirmed live: a file-pull connection failed with "Invalid
+/// argument" (EINVAL) after reconstructing a link-local peer address this
+/// way — this network happened to route the message-server connection over
+/// global IPv6 in most tests, masking the bug until it didn't.
+fn with_port(addr: std::net::SocketAddr, port: u16) -> std::net::SocketAddr {
+    match addr {
+        std::net::SocketAddr::V4(v4) => std::net::SocketAddr::new((*v4.ip()).into(), port),
+        std::net::SocketAddr::V6(v6) => {
+            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(*v6.ip(), port, v6.flowinfo(), v6.scope_id()))
+        }
+    }
+}
+
 /// Extracts the filename from a full **Windows** path (e.g.
 /// `C:\Users\Alan\Downloads\file.txt`), which the file-transfer header's
 /// `name` field always is for a normal file copy. `std::path::Path` isn't
@@ -862,16 +879,17 @@ fn run_session(
                 println!("[{role}] Received a file-available beat, pulling now.");
                 let cfg = cfg.clone();
                 let shared_for_pull = shared.clone();
-                // Reuse this already-live connection's peer IP rather than
-                // re-resolving cfg.windows_ip's hostname independently — a
-                // fresh resolution can non-deterministically pick a
+                // Reuse this already-live connection's peer address (IP,
+                // and scope ID if IPv6 link-local — see with_port) rather
+                // than re-resolving cfg.windows_ip's hostname independently
+                // — a fresh resolution can non-deterministically pick a
                 // different address (confirmed live: it picked an IPv6
                 // link-local address once, which Windows' clipboard-server
                 // rejected outright as "Unknown" since it only has this
                 // machine's IPv4 address on file).
-                let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+                let peer_addr = stream.peer_addr().ok();
                 std::thread::spawn(move || {
-                    if let Err(e) = pull_file_from_windows(&cfg, peer_ip, &shared_for_pull) {
+                    if let Err(e) = pull_file_from_windows(&cfg, peer_addr, &shared_for_pull) {
                         eprintln!("(clipboard: file pull failed: {e})");
                     }
                 });
@@ -907,11 +925,11 @@ fn prime_connection(stream: &mut TcpStream, cipher: &CbcState, write_chain: &mut
 /// pull a file it just announced via a beat on the message server, and
 /// applies it to the local clipboard once fully received. See PROTOCOL.md's
 /// clipboard-sync section for the wire format this implements.
-fn pull_file_from_windows(cfg: &Config, peer_ip: Option<std::net::IpAddr>, shared: &ClipboardShared) -> std::io::Result<()> {
-    let mut stream = match peer_ip {
-        Some(ip) => {
-            let addr = std::net::SocketAddr::new(ip, FILE_LISTEN_PORT);
-            println!("[file-pull] Connecting to {addr} (same IP as the live message-server connection)...");
+fn pull_file_from_windows(cfg: &Config, peer_addr: Option<std::net::SocketAddr>, shared: &ClipboardShared) -> std::io::Result<()> {
+    let mut stream = match peer_addr {
+        Some(addr) => {
+            let addr = with_port(addr, FILE_LISTEN_PORT);
+            println!("[file-pull] Connecting to {addr} (same address as the live message-server connection)...");
             TcpStream::connect(addr)?
         }
         None => {

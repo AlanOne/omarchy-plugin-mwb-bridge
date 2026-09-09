@@ -196,6 +196,10 @@ every packet**, not just the first one.
   modifier keys) all land correctly on the Linux side. See below for what
   it actually took to get here — none of it was in the wire protocol.
 - **Clipboard sync, both directions, text only** (small-path, see below).
+- **File copy/paste, Windows -> Omarchy only** (big-path, see below) —
+  copying a file on Windows lands as a real, pasteable clipboard entry
+  here. The reverse direction is a confirmed architectural dead end
+  against a real, unmodified PowerToys install, not a bug — see below.
 
 ## Clipboard sync
 
@@ -212,15 +216,16 @@ against — not guessed from the `PackageType` enum names.
   connection** (port 15101 — the same one Mouse/Keyboard already use). Pure
   push, no announce/ask step. **This is what's implemented here, both
   directions.**
-- **Big path** (≥1MB, or file drag-drop up to 100MB): sender only broadcasts a
-  small "beat" announcing big data is available; the actual bytes go over the
-  **separate clipboard-server socket** (`BASE_PORT`/15100,
-  `AcceptConnectionAndSendClipboardData`), framed as a 1024-byte
-  `"{size}*{filename}"` header followed by a raw byte stream — not chunked
-  into 32/64-byte DATA packages at all. Uses `ClipboardAsk`/`ClipboardPush`/
-  `ClipboardCapture`/`ClipboardDragDrop*`/`ExplorerDragDrop`/
-  `CaptureScreenCommand`, none of which this repo implements. **Not
-  implemented** — a real gap if you copy something huge or drag-drop a file.
+- **Big path** (≥1MB, or a normal file copy/paste — not drag-and-drop, see
+  below): sender broadcasts a small "beat" (`Clipboard=69`, `Des=ID.ALL`, no
+  other payload — `Common.SendClipboardBeat`) over the message server
+  announcing data is available; the actual bytes go over a **separate,
+  fresh clipboard-server connection** (`BASE_PORT`/15100), framed as a
+  1024-byte `"{size}*{filename}"` header followed by a raw byte stream —
+  not chunked into 32/64-byte DATA packages at all. **Implemented for
+  files, Windows -> Omarchy direction only** — see below for both the
+  wire details and why the reverse direction doesn't work against a real,
+  unmodified PowerToys install.
 
 ### Small-path framing
 
@@ -309,6 +314,78 @@ later chunks as duplicates of the first.
   the sender (same chunking, but `Type = ClipboardImage`, raw bytes, no
   compression, no text-format tagging) — confirmed safe to implement text now
   and images later without touching this logic, if ever needed.
+
+### Big path (file transfer): what's implemented, and two real bugs found live
+
+**Only "copy a file, paste it elsewhere" is implemented — not visual
+drag-and-drop.** Real MWB has two genuinely separate trigger paths that
+both end up at the same big-path transfer mechanism: a normal file copy
+(`Clipboard.cs`'s `CheckClipboardEx`, `isFilePath` branch) and actual
+Win32 drag-and-drop (`DragDrop.cs` — a ~200-line state machine involving a
+hidden helper window physically repositioned under the cursor every 20ms
+to intercept a native `DragEnter` event, IPC to a helper process, and
+native window messages). The drag-and-drop path is fundamentally tied to
+Win32 APIs and a helper GUI process with no meaningful equivalent for a
+headless Linux daemon — deliberately out of scope. Folders aren't
+supported either (real MWB itself refuses them, telling the user to zip
+first), and only one file at a time (real MWB's own transfer code only
+ever handles a single `LastDragDropFile`, never a multi-file selection —
+this repo's own `parse_first_file_uri` matches that by only ever looking
+at the first line of a `text/uri-list`).
+
+**Clipboard-server handshake, in full**: same AES/priming-block scheme as
+the message server, on its own fresh connection with its own fresh
+IV/chain state. Then a 64-byte handshake package — but **this one has no
+checksum/magic-number scheme at all**, unlike the message server's
+Handshake/HandshakeAck. Confirmed the hard way: `finalize_send_buf`
+(which writes checksum/magic bytes into positions 1-3) was called on it
+in an early version of `pull_file_from_windows`/`serve_file_to_peer`.
+Since `PackageType.Type` marshals as a full 4-byte little-endian int on
+the C# side (`Id` sits at `FieldOffset(sizeof(PackageType))` == 4, same
+struct layout already documented above), those checksum bytes landed in
+what Windows reads as the *upper 24 bits of the same Type field* —
+corrupting it into a value matching neither `Clipboard` (69, "I'm
+pulling") nor `ClipboardPush` (79, "I'm about to push the bytes"). The
+connection read fine and Windows replied with its own well-formed
+handshake either way, but then closed without ever sending the header,
+surfacing as a real Windows toast: `"Clipboard connection rejected:
+Unknown: [ip]:port/id"`. **Fix: send the raw handshake bytes unmodified**
+— no `finalize_send_buf` call for this specific package type, in either
+direction.
+
+**The file-transfer header's filename is a full Windows path**
+(`C:\Users\Alan\...\file.txt`), not just a basename. `std::path::Path`
+only recognizes `/` as a separator on Linux — `Path::new(windows_path)
+.file_name()` returns the *entire* backslash-laden string as one
+component, confirmed live (a received file landed named literally the
+full Windows path). Split on both `/` and `\` manually instead
+(`windows_basename` in `daemon.rs`) rather than relying on `Path`.
+
+**Reuse the live message-server connection's peer IP for the file-pull
+connection** rather than re-resolving the configured hostname
+independently — a fresh DNS/mDNS resolution can non-deterministically
+pick a different address on a dual-stack network. Wasn't the actual root
+cause of the "Unknown" rejection above (that was purely the checksum
+bug), but a real correctness issue in its own right: worth eliminating
+the possibility of the two connections looking like different peers to
+Windows.
+
+**Confirmed, via live testing, that the reverse direction (Omarchy ->
+Windows) is a genuine architectural dead end, not a bug**: the beat sends
+fine and Windows' own Mini Log confirms it sees the connection as
+"Connected", but real MWB's own file auto-pull (`Receiver.cs`'s `case
+MachineSwitched:` handler) only fires around its internal "machine
+switched" event — and this bridge never sends or receives anything
+resembling a `MachineSwitched` package (it's a simple one-way input-
+forwarding design, not a full peer in MWB's multi-machine switching
+protocol). From Windows' own perspective, control likely never
+registers as having "switched away" from it in the first place, so there
+may be no switch event to trigger on at all, regardless of what hotkey
+or edge-crossing the user tries. Confirmed empirically: announced a file,
+tried both the hotkey and waiting, Windows never connected to this
+repo's file-server listener (port 15100) at all. Making this direction
+work would mean implementing a real slice of MWB's `MachineSwitched`
+protocol — a bigger, more uncertain project than file transfer itself.
 
 ## The real blocker was never the wire protocol — it was Windows-side state
 

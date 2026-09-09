@@ -11,8 +11,9 @@ Hyprland because `xdg-desktop-portal-hyprland` doesn't implement the
 **Status: working end-to-end.** Mouse (movement, clicks, scroll) and
 keyboard both forward, via either edge-crossing or the `Ctrl+Alt+F1`-style
 hotkey switch, plain-text clipboard content syncs both ways automatically,
-and it runs as an auto-starting, auto-reconnecting systemd user service.
-See **Known bugs** below for current rough edges.
+copying a file on Windows makes it pasteable here too, and it runs as an
+auto-starting, auto-reconnecting systemd user service. See **Known bugs**
+below for current rough edges.
 
 ## Known bugs
 
@@ -44,10 +45,20 @@ See **Known bugs** below for current rough edges.
   in Omarchy itself) at the same time — either the daemon reacting to a
   Lock-type packet from Windows if one exists in the protocol, or just a
   second, independent hotkey on this side.
-- **Clipboard images and large payloads/files.** Real Mouse Without
-  Borders' clipboard protocol has a completely separate "big path" (over
-  1MB, or file drag-drop) using its own socket and framing — not
-  implemented, text-only for now.
+- **Clipboard images.** Not implemented, text/files only for now — see
+  `daemon/PROTOCOL.md`'s clipboard section for why it's a separable,
+  independently-addable code path whenever it's worth doing.
+- **File copy/paste back to Windows** (Omarchy -> Windows direction).
+  Copying a file here does get announced to Windows correctly, but a real,
+  unmodified PowerToys install's own file-pull only ever triggers on its
+  internal "machine switched" event — and since this bridge never
+  participates in that (it's a simple one-way input-forwarding design, not
+  a full peer in Mouse Without Borders' multi-machine switching protocol),
+  Windows likely never even sees a switch to trigger on. Confirmed live:
+  the announcement sends fine, Windows never connects to pull it. Making
+  this direction work would mean implementing a real slice of that
+  switching protocol — a bigger, more uncertain project than file transfer
+  itself, not a quick fix.
 
 ## How it's put together
 
@@ -82,8 +93,20 @@ Windows (detected by polling `wl-paste` every 500ms; both need
 `wl-clipboard` installed, which is standard on Omarchy). Applying one
 side's copy to the other doesn't bounce straight back — each side tracks
 what it just applied from its peer and skips re-sending an exact echo of
-it. See **Ideas for later** above for what's not covered yet (images, and
-large payloads/files).
+it. See **Ideas for later** above for what's not covered yet (images).
+
+## Files
+
+Copying a file on Windows makes it show up here as a real, pasteable
+clipboard entry (a `text/uri-list` pointing at a copy of it under
+`~/.cache/omarchy-mwb-bridge-files/`) — tested end-to-end including an
+actual paste into a file manager. The reverse direction (copying a file
+here so it pastes on Windows) only gets halfway: it's correctly announced
+to Windows, but a real PowerToys install won't actually come fetch it — see
+**Ideas for later** above for why. Multiple files at once aren't supported
+(matches a real limitation of Mouse Without Borders' own file-transfer
+code, not something narrowed further here) — only the first file of a
+multi-file selection is used, the rest silently ignored.
 
 ## Install
 

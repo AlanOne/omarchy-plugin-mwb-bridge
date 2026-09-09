@@ -3,13 +3,14 @@
 // feeds decoded Mouse/Keyboard packets into the Wayland injector. See
 // PROTOCOL.md for the wire protocol this implements.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flate2::read::DeflateDecoder;
 use mwb_omarchy_bridge::config::{self, Config};
@@ -81,6 +82,57 @@ const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 // LLKHF_UP: bit 7 of a low-level-keyboard-hook's flags marks a key-up event.
 const LLKHF_UP: u32 = 0x80;
+
+const VK_L: u32 = 0x4C;
+
+// Real MWB's own HotKeyLockMachine feature (a double-tap of the configured
+// combo — Win+L here, confirmed with Alan, an unmodified default) sends the
+// combo's own keys as an ordinary Keyboard-packet burst before locking
+// itself: all keys down back-to-back, then all up back-to-back, no new
+// package type — see PROTOCOL.md. No natural keypress produces this
+// pattern (a human pressing even a 2-key chord has real, non-zero timing
+// between each key), so a tight time window reliably distinguishes it.
+const LOCK_COMBO_WINDOW: Duration = Duration::from_millis(150);
+
+/// Recognizes that burst arriving as regular Keyboard packets: a small
+/// ring buffer of recent (vk, pressed) events with timestamps, firing once
+/// LWIN-down, L-down, LWIN-up, and L-up are all present within
+/// `LOCK_COMBO_WINDOW` of each other (order doesn't matter beyond that —
+/// real MWB sends down-then-up, but matching by presence-in-window is
+/// simpler and just as reliable given no natural keypress could produce
+/// this set that fast either way).
+struct LockComboDetector {
+    recent: VecDeque<(u32, bool, Instant)>,
+}
+
+impl LockComboDetector {
+    fn new() -> Self {
+        Self { recent: VecDeque::with_capacity(8) }
+    }
+
+    /// Returns true (once) when the combo is detected — clears its buffer
+    /// afterward so the same burst can't re-fire on a later call.
+    fn observe(&mut self, vk: u32, pressed: bool) -> bool {
+        let now = Instant::now();
+        self.recent.push_back((vk, pressed, now));
+        while self.recent.len() > 8 {
+            self.recent.pop_front();
+        }
+        while self.recent.front().is_some_and(|&(_, _, t)| now.duration_since(t) > LOCK_COMBO_WINDOW) {
+            self.recent.pop_front();
+        }
+
+        let is_win = |v: u32| v == 0x5B || v == 0x5C;
+        let has = |target_win: bool, want_pressed: bool| {
+            self.recent.iter().any(|&(v, p, _)| p == want_pressed && (if target_win { is_win(v) } else { v == VK_L }))
+        };
+        let fired = has(true, true) && has(false, true) && has(true, false) && has(false, false);
+        if fired {
+            self.recent.clear();
+        }
+        fired
+    }
+}
 
 struct ModState {
     depressed: u32,
@@ -368,6 +420,21 @@ fn apply_incoming_clipboard_file(dest: &Path, last_applied_file_uri: &Arc<Mutex<
     *last_applied_file_uri.lock().unwrap() = Some(uri);
 }
 
+/// Locks this machine's session in response to Windows' own lock-both-
+/// machines double-tap (see `LockComboDetector`) — `omarchy-system-lock`
+/// is the same command Omarchy's own idle-service uses for its own
+/// timeout-triggered lock (`Service.qml`'s `lockSystem()`), so this landing
+/// as a fresh press of it needs no special-casing on the Omarchy side.
+fn lock_local_machine() {
+    println!("[client] Windows' lock-both-machines combo detected — locking this machine too.");
+    match Command::new("omarchy-system-lock").spawn() {
+        Ok(mut child) => {
+            let _ = child.wait();
+        }
+        Err(e) => eprintln!("(lock: failed to launch omarchy-system-lock: {e})"),
+    }
+}
+
 /// Reads `size` real bytes from a clipboard-server connection's raw file
 /// stream, decrypting as it goes. Real MWB pads the actual transmitted
 /// byte count up to a multiple of `PACKAGE_SIZE` (32) with zero-fill after
@@ -498,6 +565,7 @@ fn run_session(
     println!("[{role}] Handshake sent, entering receive loop.");
 
     let mut mods = ModState::new();
+    let mut lock_combo = LockComboDetector::new();
     let mut hi_count = 0u64;
     let mut clipboard_buf: Vec<u8> = Vec::new();
     let mut clipboard_kind: Option<u8> = None;
@@ -591,6 +659,9 @@ fn run_session(
                 // dwFlags slots), not 16/20 as originally assumed.
                 let vk = unpack_u32_le(&full, 24);
                 let flags = unpack_u32_le(&full, 28);
+                if lock_combo.observe(vk, (flags & LLKHF_UP) == 0) {
+                    lock_local_machine();
+                }
                 if let Some(w) = wl.as_deref_mut() {
                     println!(">>> KEYBOARD vk=0x{vk:x} flags=0x{flags:x}");
                     handle_keyboard(w, &mut mods, vk, flags);

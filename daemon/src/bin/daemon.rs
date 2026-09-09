@@ -245,10 +245,14 @@ struct ClipboardShared {
     // The exact `file://...` URI most recently applied from a received
     // file, for the same echo-prevention purpose.
     last_applied_file_uri: Arc<Mutex<Option<String>>>,
-    // The local file (if any) currently available to serve when Windows
-    // connects to our file-server listener — set when the local clipboard
-    // watcher detects a new local file, read by that listener.
-    pending_outbound_file: Arc<Mutex<Option<PathBuf>>>,
+    // The exact PNG bytes most recently applied from a received clipboard
+    // image, for the same echo-prevention purpose.
+    last_applied_image: Arc<Mutex<Option<Vec<u8>>>>,
+    // What's currently available to serve when Windows connects to our
+    // file-server listener (big-path only — small-path file/image sync
+    // sends inline and never touches this) — set when the local clipboard
+    // watcher detects new local big-path content, read by that listener.
+    pending_outbound: Arc<Mutex<Option<PendingOutbound>>>,
 }
 
 impl ClipboardShared {
@@ -256,9 +260,21 @@ impl ClipboardShared {
         Self {
             last_applied_text: Arc::new(Mutex::new(None)),
             last_applied_file_uri: Arc::new(Mutex::new(None)),
-            pending_outbound_file: Arc::new(Mutex::new(None)),
+            last_applied_image: Arc::new(Mutex::new(None)),
+            pending_outbound: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+/// A local file on disk ready to serve over the big-path clipboard-server
+/// connection — either a real file (served under its own name) or a
+/// clipboard image over the small-path size threshold (written to a temp
+/// file, served under the literal `BIG_PATH_IMAGE_NAME` tag real MWB uses
+/// for this case instead of a filename).
+#[derive(Clone)]
+enum PendingOutbound {
+    File(PathBuf),
+    Image(PathBuf),
 }
 
 /// What the local clipboard-watcher thread detected and handed off to the
@@ -266,6 +282,8 @@ impl ClipboardShared {
 enum ClipboardEvent {
     Text(String),
     File(PathBuf),
+    Image(Vec<u8>),
+    BigImage(PathBuf),
 }
 
 /// Windows -> Omarchy clipboard sync, small-path text only (real MWB's
@@ -323,6 +341,15 @@ fn read_local_clipboard_text() -> Option<String> {
 fn read_local_clipboard_uri_list() -> Option<String> {
     let output = Command::new("wl-paste").args(["--no-newline", "--type", "text/uri-list"]).output().ok()?;
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Reads the Linux clipboard's current `image/png` content as raw bytes, if
+/// any — same non-zero-exit-means-nothing convention as
+/// `read_local_clipboard_text`, but binary-safe (no `--no-newline`, which
+/// is a text-only concern; PNG bytes are used byte-for-byte as-is).
+fn read_local_clipboard_image() -> Option<Vec<u8>> {
+    let output = Command::new("wl-paste").args(["--type", "image/png"]).output().ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 /// Decodes `%XX` percent-escapes in a `file://` URI's path portion back
@@ -420,6 +447,28 @@ fn apply_incoming_clipboard_file(dest: &Path, last_applied_file_uri: &Arc<Mutex<
     *last_applied_file_uri.lock().unwrap() = Some(uri);
 }
 
+/// Applies received clipboard-image bytes directly to the Linux clipboard
+/// as `image/png` — no decoding needed, real MWB's wire payload for
+/// ClipboardImage is already a plain PNG file verbatim (confirmed from
+/// source: `image.Save(stream, ImageFormat.Png)` on the sending side,
+/// `Image.FromStream` on receipt), unlike text there's no tag/SEP wrapper
+/// or compression to undo.
+fn apply_incoming_clipboard_image(png_bytes: &[u8], last_applied_image: &Arc<Mutex<Option<Vec<u8>>>>) {
+    let mut child = match Command::new("wl-copy").args(["--type", "image/png"]).stdin(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("(clipboard: failed to launch wl-copy for image: {e})");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(png_bytes);
+    }
+    let _ = child.wait();
+    *last_applied_image.lock().unwrap() = Some(png_bytes.to_vec());
+    println!("(clipboard: applied a {}-byte image from Windows)", png_bytes.len());
+}
+
 /// Locks this machine's session in response to Windows' own lock-both-
 /// machines double-tap (see `LockComboDetector`) — `omarchy-system-lock`
 /// is the same command Omarchy's own idle-service uses for its own
@@ -483,6 +532,7 @@ fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8;
 /// daemon started doesn't get pushed to Windows unexpectedly.
 fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShared) {
     let mut last_seen_file = read_local_clipboard_uri_list().as_deref().and_then(parse_first_file_uri);
+    let mut last_seen_image = read_local_clipboard_image();
     let mut last_seen_text = read_local_clipboard_text();
     loop {
         std::thread::sleep(Duration::from_millis(500));
@@ -496,7 +546,32 @@ fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShare
                     let _ = clip_tx.send(ClipboardEvent::File(path));
                 }
             }
-            continue; // a file is present — don't also fall through to the text check
+            continue; // a file is present — don't also fall through to image/text
+        }
+
+        if let Some(bytes) = read_local_clipboard_image() {
+            if last_seen_image.as_ref() != Some(&bytes) {
+                last_seen_image = Some(bytes.clone());
+                let is_echo = shared.last_applied_image.lock().unwrap().as_deref() == Some(bytes.as_slice());
+                if !is_echo {
+                    if bytes.len() < MAX_SMALL_PATH_SIZE {
+                        let _ = clip_tx.send(ClipboardEvent::Image(bytes));
+                    } else {
+                        // Big-path: write to a fixed temp file (only ever
+                        // one pending outbound image at a time) and let the
+                        // existing file-transfer machinery serve it,
+                        // tagged as an image rather than a real filename.
+                        let dir = clipboard_files_dir();
+                        if std::fs::create_dir_all(&dir).is_ok() {
+                            let path = dir.join("outbound-image.png");
+                            if std::fs::write(&path, &bytes).is_ok() {
+                                let _ = clip_tx.send(ClipboardEvent::BigImage(path));
+                            }
+                        }
+                    }
+                }
+            }
+            continue; // an image is present — don't also fall through to text
         }
 
         let Some(current) = read_local_clipboard_text() else { continue };
@@ -589,9 +664,18 @@ fn run_session(
                     }
                     println!("[{role}] Sent clipboard text ({} chars) to peer.", text.chars().count());
                 }
+                Some(ClipboardEvent::Image(png_bytes)) => {
+                    let len = png_bytes.len();
+                    for mut pkg in build_clipboard_image_packages(&mut next_clip_id, cfg.machine_id, &png_bytes) {
+                        finalize_send_buf(&mut pkg, magic_number);
+                        let ct = cipher.encrypt(&mut write_chain, &pkg);
+                        stream.write_all(&ct)?;
+                    }
+                    println!("[{role}] Sent clipboard image ({len} bytes) to peer.");
+                }
                 Some(ClipboardEvent::File(path)) => {
                     let name = path.display();
-                    *shared.pending_outbound_file.lock().unwrap() = Some(path.clone());
+                    *shared.pending_outbound.lock().unwrap() = Some(PendingOutbound::File(path.clone()));
                     let mut beat = build_clipboard_beat(next_clip_id, cfg.machine_id);
                     next_clip_id += 1;
                     finalize_send_buf(&mut beat, magic_number);
@@ -599,6 +683,17 @@ fn run_session(
                     stream.write_all(&ct)?;
                     println!(
                         "[{role}] Announced file {name} to peer (served if/when it connects to pull it)."
+                    );
+                }
+                Some(ClipboardEvent::BigImage(path)) => {
+                    *shared.pending_outbound.lock().unwrap() = Some(PendingOutbound::Image(path));
+                    let mut beat = build_clipboard_beat(next_clip_id, cfg.machine_id);
+                    next_clip_id += 1;
+                    finalize_send_buf(&mut beat, magic_number);
+                    let ct = cipher.encrypt(&mut write_chain, &beat);
+                    stream.write_all(&ct)?;
+                    println!(
+                        "[{role}] Announced a big clipboard image to peer (served if/when it connects to pull it)."
                     );
                 }
                 None => {}
@@ -681,7 +776,7 @@ fn run_session(
                         apply_incoming_clipboard_text(&clipboard_buf, &shared.last_applied_text)
                     }
                     Some(PACKAGE_TYPE_CLIPBOARD_IMAGE) => {
-                        println!("(clipboard: ignoring incoming image — text only for now)")
+                        apply_incoming_clipboard_image(&clipboard_buf, &shared.last_applied_image)
                     }
                     _ => {}
                 }
@@ -699,7 +794,7 @@ fn run_session(
                 // shouldn't block this connection's own receive loop.
                 println!("[{role}] Received a file-available beat, pulling now.");
                 let cfg = cfg.clone();
-                let last_applied_file_uri = shared.last_applied_file_uri.clone();
+                let shared_for_pull = shared.clone();
                 // Reuse this already-live connection's peer IP rather than
                 // re-resolving cfg.windows_ip's hostname independently — a
                 // fresh resolution can non-deterministically pick a
@@ -709,7 +804,7 @@ fn run_session(
                 // machine's IPv4 address on file).
                 let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
                 std::thread::spawn(move || {
-                    if let Err(e) = pull_file_from_windows(&cfg, peer_ip, &last_applied_file_uri) {
+                    if let Err(e) = pull_file_from_windows(&cfg, peer_ip, &shared_for_pull) {
                         eprintln!("(clipboard: file pull failed: {e})");
                     }
                 });
@@ -745,11 +840,7 @@ fn prime_connection(stream: &mut TcpStream, cipher: &CbcState, write_chain: &mut
 /// pull a file it just announced via a beat on the message server, and
 /// applies it to the local clipboard once fully received. See PROTOCOL.md's
 /// clipboard-sync section for the wire format this implements.
-fn pull_file_from_windows(
-    cfg: &Config,
-    peer_ip: Option<std::net::IpAddr>,
-    last_applied_file_uri: &Arc<Mutex<Option<String>>>,
-) -> std::io::Result<()> {
+fn pull_file_from_windows(cfg: &Config, peer_ip: Option<std::net::IpAddr>, shared: &ClipboardShared) -> std::io::Result<()> {
     let mut stream = match peer_ip {
         Some(ip) => {
             let addr = std::net::SocketAddr::new(ip, FILE_LISTEN_PORT);
@@ -813,13 +904,19 @@ fn pull_file_from_windows(
 
     let body = read_padded_body(&mut stream, &cipher, &mut read_chain, size)?;
 
+    if name == BIG_PATH_IMAGE_NAME {
+        apply_incoming_clipboard_image(&body, &shared.last_applied_image);
+        println!("[file-pull] Received a big clipboard image ({size} bytes) from Windows.");
+        return Ok(());
+    }
+
     let safe_name = windows_basename(&name);
     let dir = clipboard_files_dir();
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(&safe_name);
     std::fs::write(&dest, &body)?; // fully flushed before the clipboard is touched below
 
-    apply_incoming_clipboard_file(&dest, last_applied_file_uri);
+    apply_incoming_clipboard_file(&dest, &shared.last_applied_file_uri);
     println!("[file-pull] Received {safe_name:?} ({size} bytes) from Windows -> {}", dest.display());
     Ok(())
 }
@@ -830,7 +927,7 @@ fn pull_file_from_windows(
 /// MWB actually initiates this connection at all is genuinely uncertain
 /// (see PROTOCOL.md): its own auto-pull is gated on a "machine switched"
 /// event this bridge's topology doesn't have an equivalent of.
-fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending_file: &Arc<Mutex<Option<PathBuf>>>) -> std::io::Result<()> {
+fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option<PendingOutbound>>>) -> std::io::Result<()> {
     let cipher = CbcState::new(&derive_key(&cfg.security_key));
     let mut read_chain = derive_iv();
     let mut write_chain = derive_iv();
@@ -846,15 +943,22 @@ fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending_file: &Arc<Mu
     stream.read_exact(&mut peer_hs_ct)?;
     let _peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
 
-    let Some(file_path) = pending_file.lock().unwrap().clone() else {
-        println!("[file-serve] Peer connected but no file is currently pending — sending an empty/error header.");
-        let header = build_file_header(0, "No file currently available");
+    let current = pending.lock().unwrap().clone();
+    let Some(outbound) = current else {
+        println!("[file-serve] Peer connected but nothing is currently pending — sending an empty/error header.");
+        let header = build_file_header(0, "Nothing currently available");
         stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
         return Ok(());
     };
 
-    let data = std::fs::read(&file_path)?;
-    let name = file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
+    let (path, name) = match &outbound {
+        PendingOutbound::File(path) => {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
+            (path.clone(), name)
+        }
+        PendingOutbound::Image(path) => (path.clone(), BIG_PATH_IMAGE_NAME.to_string()),
+    };
+    let data = std::fs::read(&path)?;
     let header = build_file_header(data.len(), &name);
     stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
     write_padded_body(&mut stream, &cipher, &mut write_chain, &data)?;
@@ -863,8 +967,9 @@ fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending_file: &Arc<Mu
 }
 
 /// Listens on the clipboard-server port (15100) for Windows connecting in
-/// to pull a file we've announced. Mirrors `run_server_listener`'s shape.
-fn run_file_server_listener(cfg: Config, pending_file: Arc<Mutex<Option<PathBuf>>>) {
+/// to pull whatever's pending (a file or a big clipboard image). Mirrors
+/// `run_server_listener`'s shape.
+fn run_file_server_listener(cfg: Config, pending: Arc<Mutex<Option<PendingOutbound>>>) {
     let listener = match TcpListener::bind(("0.0.0.0", FILE_LISTEN_PORT)) {
         Ok(l) => l,
         Err(e) => {
@@ -880,9 +985,9 @@ fn run_file_server_listener(cfg: Config, pending_file: Arc<Mutex<Option<PathBuf>
                 println!("[file-serve] Accepted connection from {:?}", stream.peer_addr());
                 set_socket_timeouts(&stream);
                 let cfg = cfg.clone();
-                let pending_file = pending_file.clone();
+                let pending = pending.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_file_to_peer(stream, &cfg, &pending_file) {
+                    if let Err(e) = serve_file_to_peer(stream, &cfg, &pending) {
                         eprintln!("[file-serve] Session ended: {e}");
                     }
                 });
@@ -971,8 +1076,8 @@ fn main() {
     }
     {
         let cfg = cfg.clone();
-        let pending_file = clipboard_shared.pending_outbound_file.clone();
-        std::thread::spawn(move || run_file_server_listener(cfg, pending_file));
+        let pending = clipboard_shared.pending_outbound.clone();
+        std::thread::spawn(move || run_file_server_listener(cfg, pending));
     }
     {
         let shared = clipboard_shared.clone();

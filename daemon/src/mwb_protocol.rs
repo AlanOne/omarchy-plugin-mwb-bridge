@@ -40,6 +40,18 @@ pub const ID_ALL: u32 = 255;
 // sender before ever announcing a file.
 pub const MAX_CLIPBOARD_FILE_SIZE: usize = 100 * 1024 * 1024;
 
+// Real MWB's own small-path/big-path threshold
+// (MAX_CLIPBOARD_DATA_SIZE_CAN_BE_SENT_INSTANTLY_TCP), applied uniformly to
+// both text and image clipboard data — under this, push directly over the
+// message-server connection; at or above it, announce a beat and let the
+// peer pull it over the separate clipboard-server connection instead.
+pub const MAX_SMALL_PATH_SIZE: usize = 1024 * 1024;
+
+// The literal type-tag real MWB uses in the big-path file-transfer header's
+// `name` field when the payload is a clipboard image rather than a real
+// file — confirmed from source, not a filename to be sanitized/basenamed.
+pub const BIG_PATH_IMAGE_NAME: &str = "image";
+
 // Small-path clipboard chunking (Clipboard.cs's DATA_SIZE): a ClipboardText/
 // ClipboardImage "big" (64-byte) package repurposes bytes 16-63 — normally
 // Machine1-4 + MachineName — as one contiguous 48-byte raw-data region.
@@ -194,25 +206,41 @@ pub fn build_clipboard_text_packages(next_id: &mut u32, src_id: u32, text: &str)
         enc.write_all(&utf16).expect("compressing into a Vec<u8> cannot fail");
     }
 
+    build_clipboard_chunk_packages(next_id, src_id, PACKAGE_TYPE_CLIPBOARD_TEXT, &compressed)
+}
+
+/// Builds the outgoing ClipboardImage chunk sequence (+ trailing
+/// ClipboardDataEnd) for small-path image sync (payload under 1MB — see
+/// PROTOCOL.md for the size threshold and the big-path fallback for larger
+/// images). Unlike text, real MWB applies **no compression and no
+/// text-format tagging** to image data at all — the wire payload is simply
+/// the clipboard image's own PNG bytes, verbatim (confirmed from source:
+/// `image.Save(stream, ImageFormat.Png)` on the sending side, `Image
+/// .FromStream` on receipt — a plain PNG file both ways, nothing custom).
+pub fn build_clipboard_image_packages(next_id: &mut u32, src_id: u32, png_bytes: &[u8]) -> Vec<[u8; PACKAGE_SIZE_EX]> {
+    build_clipboard_chunk_packages(next_id, src_id, PACKAGE_TYPE_CLIPBOARD_IMAGE, png_bytes)
+}
+
+fn build_clipboard_chunk_packages(next_id: &mut u32, src_id: u32, package_type: u8, payload: &[u8]) -> Vec<[u8; PACKAGE_SIZE_EX]> {
     let mut packages = Vec::new();
-    let mut build_header = |buf: &mut [u8; PACKAGE_SIZE_EX], package_type: u8| {
-        buf[0] = package_type;
+    let mut build_header = |buf: &mut [u8; PACKAGE_SIZE_EX], pt: u8| {
+        buf[0] = pt;
         pack_u32_le(buf, 4, *next_id);
         pack_u32_le(buf, 8, src_id);
         pack_u32_le(buf, 12, ID_ALL);
         *next_id += 1;
     };
 
-    if compressed.is_empty() {
-        // An empty clipboard payload still needs at least one chunk package
-        // so the receiver has something to accumulate before DataEnd.
+    if payload.is_empty() {
+        // An empty payload still needs at least one chunk package so the
+        // receiver has something to accumulate before DataEnd.
         let mut buf = [0u8; PACKAGE_SIZE_EX];
-        build_header(&mut buf, PACKAGE_TYPE_CLIPBOARD_TEXT);
+        build_header(&mut buf, package_type);
         packages.push(buf);
     }
-    for chunk in compressed.chunks(CLIPBOARD_CHUNK_SIZE) {
+    for chunk in payload.chunks(CLIPBOARD_CHUNK_SIZE) {
         let mut buf = [0u8; PACKAGE_SIZE_EX];
-        build_header(&mut buf, PACKAGE_TYPE_CLIPBOARD_TEXT);
+        build_header(&mut buf, package_type);
         buf[16..16 + chunk.len()].copy_from_slice(chunk);
         packages.push(buf);
     }

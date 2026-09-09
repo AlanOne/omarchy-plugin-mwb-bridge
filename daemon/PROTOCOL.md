@@ -195,6 +195,85 @@ every packet**, not just the first one.
   end-to-end: cursor movement, clicks, scroll wheel, and typing (including
   modifier keys) all land correctly on the Linux side. See below for what
   it actually took to get here — none of it was in the wire protocol.
+- **Clipboard sync, Windows -> Omarchy, text only** (small-path, see below).
+
+## Clipboard sync
+
+Researched from the actual `MouseWithoutBorders` module source (`Clipboard.cs`,
+`FormHelper.cs`) at the same `v0.98.1` tag everything else here was verified
+against — not guessed from the `PackageType` enum names.
+
+### Two completely different paths, chosen by size
+
+- **Small path** (payload under `MAX_CLIPBOARD_DATA_SIZE_CAN_BE_SENT_INSTANTLY_TCP`
+  = 1MB): the machine whose clipboard changed immediately broadcasts the data
+  as a sequence of `ClipboardText`/`ClipboardImage` packages (`Des = ID.ALL`)
+  followed by one `ClipboardDataEnd`, all over the **existing message-server
+  connection** (port 15101 — the same one Mouse/Keyboard already use). Pure
+  push, no announce/ask step. **This is what's implemented here.**
+- **Big path** (≥1MB, or file drag-drop up to 100MB): sender only broadcasts a
+  small "beat" announcing big data is available; the actual bytes go over the
+  **separate clipboard-server socket** (`BASE_PORT`/15100,
+  `AcceptConnectionAndSendClipboardData`), framed as a 1024-byte
+  `"{size}*{filename}"` header followed by a raw byte stream — not chunked
+  into 32/64-byte DATA packages at all. Uses `ClipboardAsk`/`ClipboardPush`/
+  `ClipboardCapture`/`ClipboardDragDrop*`/`ExplorerDragDrop`/
+  `CaptureScreenCommand`, none of which this repo implements. **Not
+  implemented** — a real gap if you copy something huge or drag-drop a file.
+
+### Small-path framing
+
+- Package type `ClipboardText = 124` (or `ClipboardImage = 125`), sent as
+  64-byte "big" packages, terminated by one 64-byte `ClipboardDataEnd = 76`
+  package (empty payload).
+- **Chunk size is 48 bytes** (`Clipboard.cs`'s `DATA_SIZE`), not the 32-byte
+  `MachineName` region "big package" would suggest — bytes 16-63 of the
+  64-byte package are one contiguous 48-byte raw-data region, repurposing what
+  would normally be `Machine1`-`Machine4` + `MachineName` for every other big-
+  package type. Only bytes 0-15 (Type + checksum/Id/Src/Des) keep their usual
+  meaning. Receiver concatenates the 48-byte chunk from every `ClipboardText`/
+  `ClipboardImage` package (in arrival order) until `ClipboardDataEnd` arrives.
+  A package of any *other* type can legitimately arrive mid-transfer (it's
+  still just one shared connection) — don't assume the stream is exclusively
+  clipboard packets while accumulating.
+
+### Text encoding — the part most likely to get skipped
+
+The payload is **not** just raw UTF-16 text:
+
+1. Build a string: `"TXT" + <plain text> + SEP`, optionally followed by
+   `"RTF" + <rtf text> + SEP` and `"HTM" + <html text> + SEP` if those clipboard
+   formats are also present. `SEP` is the **literal string**
+   `"{4CFF57F7-BEDD-43d5-AE8F-27A61E886F2F}"` (a GUID-shaped constant, not
+   parsed as one, hardcoded identically on both ends).
+2. UTF-16LE-encode the whole thing (`ASCIIEncoding.Unicode` in .NET **is**
+   UTF-16LE despite the name).
+3. Raw-DEFLATE-compress it (`DeflateStream` — **no zlib/gzip header or
+   checksum**, matches Rust's `flate2::{read,write}::Deflate{En,De}coder`
+   without any wrapper).
+4. Chunk the compressed bytes per the framing above.
+
+This repo's `apply_incoming_clipboard_text` (`daemon.rs`) reverses this and
+only extracts the `"TXT"` fragment — `RTF`/`HTM` fragments (if present) are
+ignored, matching the text-only scope. There's also a 20MB cap on the input
+string (measured before compression) on the sending side in real MWB,
+separate from the 1MB small/big-path threshold (measured on compressed
+bytes) — not relevant to the receive-only direction implemented here.
+
+### Gotchas
+
+- **Real MWB refuses to apply incoming clipboard data while at its own lock
+  screen or screensaver desktop.** This repo deliberately does *not* mirror
+  that — matches the project's general stance that KVM forwarding should work
+  through an Omarchy lock (see the removed screen-lock "Known bugs" entry).
+- **1-second debounce and same-content dedup on the sending side** (real MWB
+  only — not relevant to this repo's receive-only implementation, but matters
+  if the reverse direction is ever added: mirror both, or expect rapid-fire/
+  duplicate sends from some apps' clipboard-write patterns).
+- Image handling is a fully separate, independently-switchable code path on
+  the sender (same chunking, but `Type = ClipboardImage`, raw bytes, no
+  compression, no text-format tagging) — confirmed safe to implement text now
+  and images later without touching this logic, if ever needed.
 
 ## The real blocker was never the wire protocol — it was Windows-side state
 

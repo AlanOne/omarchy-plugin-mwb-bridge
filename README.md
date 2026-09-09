@@ -10,8 +10,10 @@ Hyprland because `xdg-desktop-portal-hyprland` doesn't implement the
 
 **Status: working end-to-end.** Mouse (movement, clicks, scroll) and
 keyboard both forward, via either edge-crossing or the `Ctrl+Alt+F1`-style
-hotkey switch, and it runs as an auto-starting, auto-reconnecting systemd
-user service. See **Known bugs** below for current rough edges.
+hotkey switch, plain-text clipboard content copied on Windows shows up on
+this machine's clipboard automatically, and it runs as an auto-starting,
+auto-reconnecting systemd user service. See **Known bugs** below for
+current rough edges.
 
 ## Known bugs
 
@@ -43,9 +45,15 @@ user service. See **Known bugs** below for current rough edges.
   in Omarchy itself) at the same time — either the daemon reacting to a
   Lock-type packet from Windows if one exists in the protocol, or just a
   second, independent hotkey on this side.
-- **Clipboard sharing.** The real Mouse Without Borders also syncs the
-  clipboard between machines; this bridge only reimplements mouse/
-  keyboard forwarding, not that part of the protocol.
+- **Clipboard sharing back to Windows.** Currently one-way (Windows ->
+  Omarchy) only — copying something on this machine doesn't reach Windows.
+  Would need a background poll/watch on the Linux clipboard plus a writer
+  thread coordinated across the daemon's reconnect loop; deliberately left
+  out of the first cut to keep it simple.
+- **Clipboard images and large payloads/files.** Real Mouse Without
+  Borders' clipboard protocol has a completely separate "big path" (over
+  1MB, or file drag-drop) using its own socket and framing — not
+  implemented, text-only for now.
 
 ## How it's put together
 
@@ -71,6 +79,13 @@ They're split this way because plugins run unsandboxed inside the
 long-running Omarchy shell process — real protocol/crypto/Wayland-protocol
 code doesn't belong in there, so it's a separate daemon the plugin only
 supervises over `systemctl` and a couple of JSON files.
+
+## Clipboard
+
+Plain text copied on Windows is applied to this machine's clipboard
+automatically (via `wl-copy` — needs `wl-clipboard` installed, which is
+standard on Omarchy). See **Ideas for later** above for what's not covered
+yet (the reverse direction, images, and large payloads/files).
 
 ## Install
 

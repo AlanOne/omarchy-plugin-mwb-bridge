@@ -6,6 +6,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flate2::read::DeflateDecoder;
@@ -162,7 +164,11 @@ fn handle_keyboard(wl: &mut WaylandInput, mods: &mut ModState, vk: u32, flags: u
 /// + content) + SEP, UTF-16LE-encode, then raw-DEFLATE-compress (no zlib/
 /// gzip wrapper) before chunking into 48-byte pieces — see PROTOCOL.md.
 /// We only care about the "TXT" fragment; RTF/HTM (if present) are ignored.
-fn apply_incoming_clipboard_text(compressed: &[u8]) {
+/// Records the applied text into `last_applied` so the outbound clipboard
+/// watcher (which polls the same Linux clipboard we're about to write to)
+/// can recognize its own echo and not immediately bounce it right back to
+/// Windows as if the Omarchy side had made a fresh local copy.
+fn apply_incoming_clipboard_text(compressed: &[u8], last_applied: &Arc<Mutex<Option<String>>>) {
     let mut inflated = Vec::new();
     if let Err(e) = DeflateDecoder::new(compressed).read_to_end(&mut inflated) {
         eprintln!("(clipboard: failed to inflate incoming text, ignoring: {e})");
@@ -187,7 +193,41 @@ fn apply_incoming_clipboard_text(compressed: &[u8]) {
         let _ = stdin.write_all(text.as_bytes());
     }
     let _ = child.wait();
+    *last_applied.lock().unwrap() = Some(text.to_string());
     println!("(clipboard: applied {} chars from Windows)", text.chars().count());
+}
+
+/// Reads the Linux clipboard's current plain-text content, if any. `wl-paste`
+/// exits non-zero (empty stdout) when the clipboard is empty or holds a
+/// non-text format (confirmed empirically) — both cases just mean "nothing
+/// to sync right now", not an error.
+fn read_local_clipboard_text() -> Option<String> {
+    let output = Command::new("wl-paste").args(["--no-newline", "--type", "text/plain"]).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Omarchy -> Windows clipboard sync: polls the Linux clipboard (there's no
+/// simple blocking "notify me on change" primitive over `wl-clipboard`'s CLI
+/// tools, so polling is the simple option) and forwards genuinely new local
+/// content into `clip_tx` for whichever connection is currently live to pick
+/// up and send. Seeds its baseline from whatever's already on the clipboard
+/// at startup without sending it — only actual *changes* get synced, so an
+/// old clipboard entry from before the daemon started doesn't get pushed to
+/// Windows unexpectedly.
+fn run_clipboard_watcher(clip_tx: Sender<String>, last_applied: Arc<Mutex<Option<String>>>) {
+    let mut last_seen = read_local_clipboard_text();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let Some(current) = read_local_clipboard_text() else { continue };
+        if last_seen.as_deref() == Some(current.as_str()) {
+            continue;
+        }
+        last_seen = Some(current.clone());
+        if last_applied.lock().unwrap().as_deref() == Some(current.as_str()) {
+            continue; // our own echo from applying Windows' clipboard moments ago
+        }
+        let _ = clip_tx.send(current);
+    }
 }
 
 /// Runs one connection's lifecycle over an already-connected/accepted
@@ -198,7 +238,21 @@ fn apply_incoming_clipboard_text(compressed: &[u8]) {
 /// healthy reverse connection, `wl = None` — nothing it sends there needs
 /// forwarding anywhere). Returns (normally via `?`) on any I/O error so the
 /// caller can reconnect/re-accept.
-fn run_session(mut stream: TcpStream, mut wl: Option<&mut WaylandInput>, role: &str, cfg: &Config) -> std::io::Result<()> {
+///
+/// `clipboard_rx` is only `Some` on the client role — outbound clipboard
+/// sync happens over the one connection real forwarding already runs over,
+/// not the cosmetic reverse-listener one, so there's no ambiguity about
+/// which of our two sockets a locally-detected clipboard change goes out
+/// on. Incoming clipboard (applying Windows' clipboard here) is handled
+/// regardless of role, since either connection could plausibly carry it.
+fn run_session(
+    mut stream: TcpStream,
+    mut wl: Option<&mut WaylandInput>,
+    role: &str,
+    cfg: &Config,
+    clipboard_rx: Option<&Receiver<String>>,
+    last_applied: &Arc<Mutex<Option<String>>>,
+) -> std::io::Result<()> {
     let magic_number = get_24bit_hash(&cfg.security_key);
     let key = derive_key(&cfg.security_key);
     let iv = derive_iv();
@@ -233,8 +287,27 @@ fn run_session(mut stream: TcpStream, mut wl: Option<&mut WaylandInput>, role: &
     let mut hi_count = 0u64;
     let mut clipboard_buf: Vec<u8> = Vec::new();
     let mut clipboard_kind: Option<u8> = None;
+    // Arbitrary starting value distinct from the handshake's id=1 above —
+    // just needs to be unique per outgoing package within this connection
+    // (see build_clipboard_text_packages's doc comment on why).
+    let mut next_clip_id: u32 = 1000;
 
     loop {
+        if let Some(rx) = clipboard_rx {
+            let mut latest = None;
+            while let Ok(text) = rx.try_recv() {
+                latest = Some(text); // coalesce rapid successive changes to the last one
+            }
+            if let Some(text) = latest {
+                for mut pkg in build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text) {
+                    finalize_send_buf(&mut pkg, magic_number);
+                    let ct = cipher.encrypt(&mut write_chain, &pkg);
+                    stream.write_all(&ct)?;
+                }
+                println!("[{role}] Sent clipboard text ({} chars) to peer.", text.chars().count());
+            }
+        }
+
         let mut ct = [0u8; PACKAGE_SIZE];
         stream.read_exact(&mut ct)?;
         let mut pt = cipher.decrypt(&mut read_chain, &ct);
@@ -304,7 +377,7 @@ fn run_session(mut stream: TcpStream, mut wl: Option<&mut WaylandInput>, role: &
             }
             PACKAGE_TYPE_CLIPBOARD_DATA_END => {
                 match clipboard_kind {
-                    Some(PACKAGE_TYPE_CLIPBOARD_TEXT) => apply_incoming_clipboard_text(&clipboard_buf),
+                    Some(PACKAGE_TYPE_CLIPBOARD_TEXT) => apply_incoming_clipboard_text(&clipboard_buf, last_applied),
                     Some(PACKAGE_TYPE_CLIPBOARD_IMAGE) => {
                         println!("(clipboard: ignoring incoming image — text only for now)")
                     }
@@ -327,19 +400,24 @@ fn run_session(mut stream: TcpStream, mut wl: Option<&mut WaylandInput>, role: &
 
 /// Outbound leg: connects to Windows' message server and injects decoded
 /// Mouse/Keyboard into Wayland. This is the connection real input forwarding
-/// runs over.
-fn run_client(cfg: &Config, wl: &mut WaylandInput) -> std::io::Result<()> {
+/// (and outbound clipboard sync) runs over.
+fn run_client(
+    cfg: &Config,
+    wl: &mut WaylandInput,
+    clipboard_rx: &Receiver<String>,
+    last_applied: &Arc<Mutex<Option<String>>>,
+) -> std::io::Result<()> {
     println!("Connecting to {}...", cfg.windows_ip);
     config::write_status(false, "", "Connecting...");
     let stream = TcpStream::connect(&cfg.windows_ip)?;
-    run_session(stream, Some(wl), "client", cfg)
+    run_session(stream, Some(wl), "client", cfg, Some(clipboard_rx), last_applied)
 }
 
 /// Inbound leg: accepts Windows' own outbound connection back to us (the
 /// reverse half of the pair it expects between two machines). Runs forever
 /// in its own thread; each accepted connection gets its own thread since
 /// nothing here touches the single-threaded Wayland event queue.
-fn run_server_listener(cfg: Config) {
+fn run_server_listener(cfg: Config, last_applied: Arc<Mutex<Option<String>>>) {
     let listener = match TcpListener::bind(("0.0.0.0", LISTEN_PORT)) {
         Ok(l) => l,
         Err(e) => {
@@ -354,8 +432,9 @@ fn run_server_listener(cfg: Config) {
             Ok(stream) => {
                 println!("[server] Accepted connection from {:?}", stream.peer_addr());
                 let cfg = cfg.clone();
+                let last_applied = last_applied.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = run_session(stream, None, "server", &cfg) {
+                    if let Err(e) = run_session(stream, None, "server", &cfg, None, &last_applied) {
                         eprintln!("[server] Session ended: {e}");
                     }
                 });
@@ -386,13 +465,21 @@ fn main() {
     let mut wl = WaylandInput::new(&cfg.xkb_layout, &cfg.xkb_variant);
     println!("Wayland input ready. Entering connect/reconnect loop.");
 
+    let last_applied_from_windows: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let (clip_tx, clip_rx) = mpsc::channel::<String>();
+
     {
         let cfg = cfg.clone();
-        std::thread::spawn(move || run_server_listener(cfg));
+        let last_applied = last_applied_from_windows.clone();
+        std::thread::spawn(move || run_server_listener(cfg, last_applied));
+    }
+    {
+        let last_applied = last_applied_from_windows.clone();
+        std::thread::spawn(move || run_clipboard_watcher(clip_tx, last_applied));
     }
 
     loop {
-        if let Err(e) = run_client(&cfg, &mut wl) {
+        if let Err(e) = run_client(&cfg, &mut wl, &clip_rx, &last_applied_from_windows) {
             eprintln!("Connection ended: {e}. Reconnecting in 3s...");
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
         }

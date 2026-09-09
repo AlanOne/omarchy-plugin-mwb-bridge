@@ -3,7 +3,11 @@
 // is the way it is. Extracted from the original mwb_probe.rs test client so
 // the real daemon doesn't duplicate this.
 
+use std::io::Write;
+
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha512};
 
@@ -154,6 +158,57 @@ pub fn build_handshake_ack(incoming: &[u8], src_id: u32, our_name: &str) -> [u8;
     let name_padded = format!("{:<32}", our_name);
     ack[32..64].copy_from_slice(&name_padded.as_bytes()[..32]);
     ack
+}
+
+/// Builds the outgoing ClipboardText chunk sequence (+ trailing
+/// ClipboardDataEnd) for Omarchy -> Windows sync: `"TXT" + text + SEP`,
+/// UTF-16LE-encoded, raw-DEFLATE-compressed (no zlib/gzip wrapper — matches
+/// what real MWB expects to receive), then split into `CLIPBOARD_CHUNK_SIZE`
+/// pieces. `next_id` is the caller's running per-connection id counter,
+/// incremented once per package built (real MWB's Id field is "used for
+/// dedup on the receive side" — a repeated id across packages risks one
+/// being silently dropped as a duplicate, so every package here needs its
+/// own distinct value, not just a shared placeholder like the 32-byte
+/// types use). Caller still owes each returned package a
+/// `finalize_send_buf` call before sending — this only fills in the type/
+/// id/src/des/data fields.
+pub fn build_clipboard_text_packages(next_id: &mut u32, src_id: u32, text: &str) -> Vec<[u8; PACKAGE_SIZE_EX]> {
+    let tagged = format!("TXT{text}{CLIPBOARD_SEP}");
+    let utf16 = utf16le_bytes(&tagged);
+
+    let mut compressed = Vec::new();
+    {
+        let mut enc = DeflateEncoder::new(&mut compressed, Compression::default());
+        enc.write_all(&utf16).expect("compressing into a Vec<u8> cannot fail");
+    }
+
+    let mut packages = Vec::new();
+    let mut build_header = |buf: &mut [u8; PACKAGE_SIZE_EX], package_type: u8| {
+        buf[0] = package_type;
+        pack_u32_le(buf, 4, *next_id);
+        pack_u32_le(buf, 8, src_id);
+        pack_u32_le(buf, 12, ID_ALL);
+        *next_id += 1;
+    };
+
+    if compressed.is_empty() {
+        // An empty clipboard payload still needs at least one chunk package
+        // so the receiver has something to accumulate before DataEnd.
+        let mut buf = [0u8; PACKAGE_SIZE_EX];
+        build_header(&mut buf, PACKAGE_TYPE_CLIPBOARD_TEXT);
+        packages.push(buf);
+    }
+    for chunk in compressed.chunks(CLIPBOARD_CHUNK_SIZE) {
+        let mut buf = [0u8; PACKAGE_SIZE_EX];
+        build_header(&mut buf, PACKAGE_TYPE_CLIPBOARD_TEXT);
+        buf[16..16 + chunk.len()].copy_from_slice(chunk);
+        packages.push(buf);
+    }
+    let mut end = [0u8; PACKAGE_SIZE_EX];
+    build_header(&mut end, PACKAGE_TYPE_CLIPBOARD_DATA_END);
+    packages.push(end);
+
+    packages
 }
 
 /// SocketStuff.TcpSendData's checksum+magic packing, applied to the first

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 aes = "0.9.3"
 cbc = "0.2.1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hex = "0.4.3"
 memfd = "0.6.6"
 pbkdf2 = "0.13.0"

@@ -19,6 +19,20 @@ pub const PACKAGE_TYPE_KEYBOARD: u8 = 122;
 pub const PACKAGE_TYPE_MOUSE: u8 = 123;
 pub const PACKAGE_TYPE_HANDSHAKE: u8 = 126;
 pub const PACKAGE_TYPE_HANDSHAKE_ACK: u8 = 127;
+pub const PACKAGE_TYPE_CLIPBOARD_DATA_END: u8 = 76;
+pub const PACKAGE_TYPE_CLIPBOARD_TEXT: u8 = 124;
+pub const PACKAGE_TYPE_CLIPBOARD_IMAGE: u8 = 125;
+pub const ID_ALL: u32 = 255;
+
+// Small-path clipboard chunking (Clipboard.cs's DATA_SIZE): a ClipboardText/
+// ClipboardImage "big" (64-byte) package repurposes bytes 16-63 — normally
+// Machine1-4 + MachineName — as one contiguous 48-byte raw-data region.
+// Terminated by one empty ClipboardDataEnd package. Text payloads are
+// "TXT" + text + SEP (+ optional "RTF"/"HTM" + content + SEP), UTF-16LE
+// encoded, then raw-DEFLATE compressed (no zlib/gzip wrapper) before
+// chunking — see PROTOCOL.md's clipboard section.
+pub const CLIPBOARD_CHUNK_SIZE: usize = 48;
+pub const CLIPBOARD_SEP: &str = "{4CFF57F7-BEDD-43d5-AE8F-27A61E886F2F}";
 
 pub fn utf16le_bytes(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()

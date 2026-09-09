@@ -5,8 +5,10 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use flate2::read::DeflateDecoder;
 use mwb_omarchy_bridge::config::{self, Config};
 use mwb_omarchy_bridge::mwb_protocol::*;
 use mwb_omarchy_bridge::vk_keycode::vk_to_evdev;
@@ -153,6 +155,41 @@ fn handle_keyboard(wl: &mut WaylandInput, mods: &mut ModState, vk: u32, flags: u
     wl.key(evdev_code, pressed);
 }
 
+/// Windows -> Omarchy clipboard sync, small-path text only (real MWB's
+/// "big path", for clipboard payloads over ~1MB or files, uses an entirely
+/// separate socket/framing on port 15100 — not implemented here). Windows'
+/// side reverses the same recipe to send: build "TXT" + text (+ "RTF"/"HTM"
+/// + content) + SEP, UTF-16LE-encode, then raw-DEFLATE-compress (no zlib/
+/// gzip wrapper) before chunking into 48-byte pieces — see PROTOCOL.md.
+/// We only care about the "TXT" fragment; RTF/HTM (if present) are ignored.
+fn apply_incoming_clipboard_text(compressed: &[u8]) {
+    let mut inflated = Vec::new();
+    if let Err(e) = DeflateDecoder::new(compressed).read_to_end(&mut inflated) {
+        eprintln!("(clipboard: failed to inflate incoming text, ignoring: {e})");
+        return;
+    }
+    let utf16: Vec<u16> = inflated.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+    let decoded = String::from_utf16_lossy(&utf16);
+
+    let Some(text) = decoded.split(CLIPBOARD_SEP).find_map(|frag| frag.strip_prefix("TXT")) else {
+        eprintln!("(clipboard: no TXT fragment in incoming data, ignoring)");
+        return;
+    };
+
+    let mut child = match Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("(clipboard: failed to launch wl-copy: {e})");
+            return;
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let _ = child.wait();
+    println!("(clipboard: applied {} chars from Windows)", text.chars().count());
+}
+
 /// Runs one connection's lifecycle over an already-connected/accepted
 /// stream: prime, handshake, then receive forever until the socket errors or
 /// closes. Shared by both the outbound client connection (which injects
@@ -194,6 +231,8 @@ fn run_session(mut stream: TcpStream, mut wl: Option<&mut WaylandInput>, role: &
 
     let mut mods = ModState::new();
     let mut hi_count = 0u64;
+    let mut clipboard_buf: Vec<u8> = Vec::new();
+    let mut clipboard_kind: Option<u8> = None;
 
     loop {
         let mut ct = [0u8; PACKAGE_SIZE];
@@ -254,6 +293,25 @@ fn run_session(mut stream: TcpStream, mut wl: Option<&mut WaylandInput>, role: &
                     println!(">>> KEYBOARD vk=0x{vk:x} flags=0x{flags:x}");
                     handle_keyboard(w, &mut mods, vk, flags);
                 }
+            }
+            PACKAGE_TYPE_CLIPBOARD_TEXT | PACKAGE_TYPE_CLIPBOARD_IMAGE => {
+                // Bytes 16-63 of a ClipboardText/ClipboardImage package are
+                // one contiguous 48-byte raw-data chunk (not Machine1-4 +
+                // MachineName, despite the same package size) — see
+                // PROTOCOL.md's clipboard section.
+                clipboard_buf.extend_from_slice(&full[16..64]);
+                clipboard_kind = Some(package_type);
+            }
+            PACKAGE_TYPE_CLIPBOARD_DATA_END => {
+                match clipboard_kind {
+                    Some(PACKAGE_TYPE_CLIPBOARD_TEXT) => apply_incoming_clipboard_text(&clipboard_buf),
+                    Some(PACKAGE_TYPE_CLIPBOARD_IMAGE) => {
+                        println!("(clipboard: ignoring incoming image — text only for now)")
+                    }
+                    _ => {}
+                }
+                clipboard_buf.clear();
+                clipboard_kind = None;
             }
             PACKAGE_TYPE_HI => {
                 hi_count += 1;

@@ -25,6 +25,11 @@ user service. See **Known bugs** below for current rough edges.
 - **Typing sometimes registers too many keystrokes** — occasional extra/
   duplicate key events land on the Omarchy side for a single physical
   keypress. Not yet root-caused.
+- **Screensaver/lock screen blocks input forwarding.** Once Omarchy's
+  screensaver kicks in or the screen locks, mouse/keyboard input from the
+  Windows side stops reaching this machine until it's unlocked locally.
+  Likely the compositor withholding virtual-pointer/keyboard input from
+  background clients while locked — not yet root-caused or fixed.
 
 ## Ideas for later
 

@@ -36,20 +36,20 @@ bugs** below for current rough edges.
   a reconnect race) not hit in that test. Needs catching in the wild: next
   time it happens, check `journalctl --user -u mwb-omarchy-bridge --since
   "2 min ago"` right away for the real packet trace.
-
-## Ideas for later
-
-- **File copy/paste back to Windows** (Omarchy -> Windows direction).
-  Copying a file here does get announced to Windows correctly, but a real,
-  unmodified PowerToys install's own file-pull only ever triggers on its
-  internal "machine switched" event — and since this bridge never
-  participates in that (it's a simple one-way input-forwarding design, not
-  a full peer in Mouse Without Borders' multi-machine switching protocol),
-  Windows likely never even sees a switch to trigger on. Confirmed live:
-  the announcement sends fine, Windows never connects to pull it. Making
-  this direction work would mean implementing a real slice of that
-  switching protocol — a bigger, more uncertain project than file transfer
-  itself, not a quick fix.
+- **File/big-image transfer back to Windows** (Omarchy -> Windows
+  direction) doesn't work, despite a genuine, thorough attempt. Copying a
+  file or large image here does get announced to Windows correctly, and
+  this repo sends the exact packet sequence real MWB's own machine-switch
+  sends (`HideMouse` + `MachineSwitched`, addressed directly to Windows'
+  machine ID — confirmed byte-for-byte identical to a real capture from
+  Windows' own `Ctrl+Alt+F1`-style switch) — but Windows still never
+  connects to pull anything. Root cause not found after several rounds of
+  reading the actual PowerToys source; see `daemon/PROTOCOL.md`'s big-path
+  section for the full investigation, including a real bug found and fixed
+  along the way (a package-ID reuse issue that was silently blocking
+  earlier attempts, now fixed, but not sufficient on its own). Documented
+  here as an investigated, unresolved limitation rather than a quick fix
+  still to come.
 
 ## How it's put together
 
@@ -97,7 +97,7 @@ clipboard entry (a `text/uri-list` pointing at a copy of it under
 actual paste into a file manager. The reverse direction (copying a file
 here so it pastes on Windows) only gets halfway: it's correctly announced
 to Windows, but a real PowerToys install won't actually come fetch it — see
-**Ideas for later** above for why. Multiple files at once aren't supported
+**Known bugs** above for why. Multiple files at once aren't supported
 (matches a real limitation of Mouse Without Borders' own file-transfer
 code, not something narrowed further here) — only the first file of a
 multi-file selection is used, the rest silently ignored.

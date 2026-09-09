@@ -459,22 +459,61 @@ bug), but a real correctness issue in its own right: worth eliminating
 the possibility of the two connections looking like different peers to
 Windows.
 
-**Confirmed, via live testing, that the reverse direction (Omarchy ->
-Windows) is a genuine architectural dead end, not a bug**: the beat sends
-fine and Windows' own Mini Log confirms it sees the connection as
-"Connected", but real MWB's own file auto-pull (`Receiver.cs`'s `case
-MachineSwitched:` handler) only fires around its internal "machine
-switched" event — and this bridge never sends or receives anything
-resembling a `MachineSwitched` package (it's a simple one-way input-
-forwarding design, not a full peer in MWB's multi-machine switching
-protocol). From Windows' own perspective, control likely never
-registers as having "switched away" from it in the first place, so there
-may be no switch event to trigger on at all, regardless of what hotkey
-or edge-crossing the user tries. Confirmed empirically: announced a file,
-tried both the hotkey and waiting, Windows never connected to this
-repo's file-server listener (port 15100) at all. Making this direction
-work would mean implementing a real slice of MWB's `MachineSwitched`
-protocol — a bigger, more uncertain project than file transfer itself.
+### The reverse direction (Omarchy -> Windows): a real, thorough attempt, still unresolved
+
+The first live test confirmed real MWB's file auto-pull is gated on
+receiving a `MachineSwitched` package (Type=77), not the `Clipboard` beat
+alone (`Receiver.cs`'s `MachineSwitched` case calls `Clipboard
+.GetRemoteClipboard`, guarded by `package.Des == Common.MachineID` and
+`Clipboard.clipboardCopiedTime` being fresh) — so this repo implements
+sending a beat, then a follow-up `MachineSwitched` addressed directly to
+Windows' own machine ID (learned from its own traffic, persisted across
+reconnects). This still didn't work, and the investigation that followed
+is worth recording in full since a lot of otherwise-reasonable hypotheses
+got ruled out one at a time:
+
+- **Confirmed `clipboardCopiedTime` really is receiver-side**, set
+  unconditionally by `Receiver.cs`'s `Clipboard` case
+  (`Clipboard.clipboardCopiedTime = Common.GetTick();`) whenever a beat is
+  received — not a sender-local variable as first suspected. The
+  mechanism should work in principle.
+- **Found and fixed a real, concrete bug along the way**: Windows' receive
+  dispatcher (`Receiver.PreProcess`) keeps a 50-slot ring buffer of
+  recently-seen package `Id` values, persisting for the *life of the
+  Windows process* — any repeat is silently dropped (no log, no error,
+  the `switch` statement never runs for it) — and `Clipboard`/
+  `MachineSwitched` are **not** among the four types exempted from this
+  (`ClipboardText`/`ClipboardImage`/`Handshake`/`HandshakeAck` are). This
+  repo's `Id` counter started at a fixed value per connection, so every
+  attempt after the very first silently resent an `Id` Windows already
+  had cached — permanently deduped, since nothing else ever evicted those
+  two slots. Fixed with a fresh random `Id` per send.
+- **Captured a real `MachineSwitched` package live** from Windows' own
+  `Ctrl+Alt+F1`-style switch (this repo already logs unhandled/rare
+  package types when debugging) and confirmed it's preceded by a
+  `HideMouse` (Type=50) package, not a `Clipboard` beat — and that its
+  byte layout (Type/Id/Src/Des offsets, zero-filled Machine1-4 trailer) is
+  **byte-for-byte identical** to what this repo already constructs.
+  Replicated the exact real sequence (`HideMouse` then `MachineSwitched`,
+  both addressed to the peer) instead of the beat-based approximation.
+- **None of the above changed the observed result.** Confirmed correct
+  packet bytes, the ID-dedup fix, and the real captured sequence — Windows
+  still never connects to this repo's file-server listener (port 15100)
+  to pull anything, tested repeatedly with fresh content each time.
+
+**Root cause not found.** The most likely remaining explanation is some
+form of connection-identity bookkeeping this repo's two-connection
+topology doesn't satisfy the same way a real MWB-to-MWB pair would (e.g.
+`SocketStuff.TcpSockets`-style per-machine socket tracking, mentioned
+elsewhere in this doc for the file-transfer handshake's `IsConnectedTo`
+check, possibly mattering again here in a way not visible from the
+isolated `MachineSwitched` case-block alone) — but this wasn't confirmed,
+just the most plausible remaining candidate after ruling out everything
+that was checked. Documented here as a genuinely investigated, unresolved
+limitation. The sending code (beat + `HideMouse` + `MachineSwitched`) is
+left in place since it's verified correct and harmless, in case a future
+PowerToys version, a different network topology, or something not yet
+understood makes it work.
 
 ## The real blocker was never the wire protocol — it was Windows-side state
 

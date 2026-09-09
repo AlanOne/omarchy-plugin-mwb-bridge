@@ -195,7 +195,7 @@ every packet**, not just the first one.
   end-to-end: cursor movement, clicks, scroll wheel, and typing (including
   modifier keys) all land correctly on the Linux side. See below for what
   it actually took to get here — none of it was in the wire protocol.
-- **Clipboard sync, Windows -> Omarchy, text only** (small-path, see below).
+- **Clipboard sync, both directions, text only** (small-path, see below).
 
 ## Clipboard sync
 
@@ -210,7 +210,8 @@ against — not guessed from the `PackageType` enum names.
   as a sequence of `ClipboardText`/`ClipboardImage` packages (`Des = ID.ALL`)
   followed by one `ClipboardDataEnd`, all over the **existing message-server
   connection** (port 15101 — the same one Mouse/Keyboard already use). Pure
-  push, no announce/ask step. **This is what's implemented here.**
+  push, no announce/ask step. **This is what's implemented here, both
+  directions.**
 - **Big path** (≥1MB, or file drag-drop up to 100MB): sender only broadcasts a
   small "beat" announcing big data is available; the actual bytes go over the
   **separate clipboard-server socket** (`BASE_PORT`/15100,
@@ -253,12 +254,46 @@ The payload is **not** just raw UTF-16 text:
    without any wrapper).
 4. Chunk the compressed bytes per the framing above.
 
-This repo's `apply_incoming_clipboard_text` (`daemon.rs`) reverses this and
-only extracts the `"TXT"` fragment — `RTF`/`HTM` fragments (if present) are
-ignored, matching the text-only scope. There's also a 20MB cap on the input
-string (measured before compression) on the sending side in real MWB,
-separate from the 1MB small/big-path threshold (measured on compressed
-bytes) — not relevant to the receive-only direction implemented here.
+This repo's `apply_incoming_clipboard_text` (receive) and
+`build_clipboard_text_packages` (send, `mwb_protocol.rs`) mirror this exactly,
+`"TXT"`-tagged only — `RTF`/`HTM` fragments are neither produced nor parsed,
+matching the text-only scope. There's also a 20MB cap on the input string
+(measured before compression) on real MWB's sending side, separate from the
+1MB small/big-path threshold (measured on compressed bytes) — not enforced
+here since nothing this size fits the small path anyway.
+
+### Both directions, and how the reverse one avoids echo loops
+
+Outbound (Omarchy -> Windows) is detection by polling, not a push
+notification: `wl-clipboard`'s CLI tools have no simple blocking "notify on
+change" primitive, so `run_clipboard_watcher` (`daemon.rs`) just polls
+`wl-paste --no-newline --type text/plain` every 500ms and forwards genuinely
+new content into an `mpsc` channel. That channel is drained (keeping only the
+latest value, coalescing rapid successive changes) once per iteration of the
+**client**-role connection's receive loop, right before it blocks on the next
+read — not from a separate writer thread, since a second thread encrypting
+and writing to the same socket would need to share (and carefully order
+around) the single continuous CBC write-chain that connection's outbound
+direction already owns; funneling everything through the one thread that
+already holds it sidesteps that entirely. Only the client-role connection
+checks this channel (the reverse-listener connection is cosmetic — see
+"Ports" above), so there's no ambiguity about which of our two sockets a
+locally-detected change goes out on. Practical latency is bounded by however
+often *some* packet arrives from Windows to unblock that read (Hi/Heartbeat
+keep this well under a second in practice, even with an idle mouse).
+
+Applying Windows' clipboard to the Linux clipboard, then having our own poll
+loop immediately notice that same content moments later and try to bounce it
+right back, is a real risk with two independently-polled clipboards feeding
+one one connection. Guarded by recording the exact text just applied
+(`last_applied`, shared via `Arc<Mutex<..>>` between the receive and poll
+sides) and skipping a send when new local content matches it exactly.
+
+Each outgoing package needs its own distinct, incrementing `Id` — the DATA
+struct's own doc comment for that field ("used for dedup on the receive
+side") means repeating one value across every chunk (harmless for receiving,
+where nothing here dedups) risks the *sender* (real MWB) side dropping
+later chunks as duplicates of the first.
 
 ### Gotchas
 
@@ -266,10 +301,10 @@ bytes) — not relevant to the receive-only direction implemented here.
   screen or screensaver desktop.** This repo deliberately does *not* mirror
   that — matches the project's general stance that KVM forwarding should work
   through an Omarchy lock (see the removed screen-lock "Known bugs" entry).
-- **1-second debounce and same-content dedup on the sending side** (real MWB
-  only — not relevant to this repo's receive-only implementation, but matters
-  if the reverse direction is ever added: mirror both, or expect rapid-fire/
-  duplicate sends from some apps' clipboard-write patterns).
+- **1-second debounce and same-content dedup on real MWB's sending side** —
+  not reproduced here; this repo's own 500ms poll interval combined with a
+  plain equality check against the last-seen value serves the same practical
+  purpose without needing an explicit timer.
 - Image handling is a fully separate, independently-switchable code path on
   the sender (same chunking, but `Type = ClipboardImage`, raw bytes, no
   compression, no text-format tagging) — confirmed safe to implement text now

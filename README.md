@@ -24,7 +24,13 @@ user service. See **Known bugs** below for current rough edges.
   for how to work out a fix for your own layout empirically).
 - **Typing sometimes registers too many keystrokes** — occasional extra/
   duplicate key events land on the Omarchy side for a single physical
-  keypress. Not yet root-caused.
+  keypress. Not yet root-caused: live-tested a single keypress and a full
+  sentence while logging the raw wire traffic and saw a clean 1:1 key-down/
+  key-up pair for every key, no duplicates — so it's rarer than normal
+  typing triggers, or tied to something specific (fast typing, a key combo,
+  a reconnect race) not hit in that test. Needs catching in the wild: next
+  time it happens, check `journalctl --user -u mwb-omarchy-bridge --since
+  "2 min ago"` right away for the real packet trace.
 
 ## Ideas for later
 

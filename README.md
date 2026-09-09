@@ -17,11 +17,13 @@ user service. See **Known bugs** below for current rough edges.
 
 - **Keyboard layout issues.** VK→evdev translation (`daemon/src/
   vk_keycode.rs`) has only been verified against a Slovenian (QWERTZ)
-  layout. Other layouts are likely to hit wrong characters somewhere,
-  especially punctuation/OEM keys — Windows can reassign those to
-  different physical keys per layout in ways that aren't derivable from
-  the VK code alone (see `daemon/PROTOCOL.md`'s keyboard-layout section
-  for how to work out a fix for your own layout empirically).
+  layout, where it now covers letters, digits, common punctuation, the
+  numpad, and AltGr/Level-3 characters (e.g. `<`/`>`). Other layouts are
+  likely to hit wrong characters somewhere, especially punctuation/OEM
+  keys — Windows can reassign those to different physical keys per layout
+  in ways that aren't derivable from the VK code alone (see
+  `daemon/PROTOCOL.md`'s keyboard-layout section for how to work out a fix
+  for your own layout empirically).
 - **Typing sometimes registers too many keystrokes** — occasional extra/
   duplicate key events land on the Omarchy side for a single physical
   keypress. Not yet root-caused: live-tested a single keypress and a full

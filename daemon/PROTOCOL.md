@@ -331,6 +331,59 @@ that VK maps to evdev/XKB differs by *kind* of key:
   the evdev code that key's *label* should produce, and hardcode that
   mapping — don't trust the VK's US-centric name.
 
+### AltGr (Level 3) characters need a separate modifier from Alt, not just a VK mapping
+
+Some layouts put characters on a third "Level 3" shift level reached via
+AltGr (Right Alt) instead of Shift — on this Slovenian layout, `<`/`>` live
+there on the comma/period keys (confirmed by reading the actual compiled
+XKB data: `/usr/share/X11/xkb/symbols/rs`'s `latlevel3` block, which `si`
+includes). Two things had to be right before these worked, verified via
+raw wire logging:
+
+- **Windows reports AltGr as a synthetic `VK_LCONTROL` immediately
+  around the real `VK_RMENU`** (both press and release) — a well-known
+  Windows low-level-hook quirk, confirmed empirically: every AltGr press
+  logs `vk=0xa2` (Ctrl) then `vk=0xa5` (Right Alt), in that order, on both
+  edges. Forwarding that fake Ctrl as a real Ctrl-held signal is mostly
+  harmless on its own, but combined with the next point it meant AltGr
+  combos could never resolve correctly.
+- **The compiled keymap binds Right Alt to Mod5 (the XKB "Level3Shift"
+  real modifier), not Mod1 ("Alt")** — this is what `level3(ralt_switch)`
+  (pulled in by `si` via `rs(latin)`) actually does to `<RALT>`. The
+  daemon originally folded `VK_RMENU` into the same bit as `VK_LMENU`
+  (`MOD_ALT`, bit 3), which never engages level 3 at all — AltGr presses
+  landed wherever Shift-state happened to leave them (level 1 or 2), never
+  level 3. **Fix** (`daemon.rs`): on `VK_RMENU`, clear the fake Ctrl bit
+  Windows' companion event set and set a separate `MOD_LEVEL3` bit
+  (`1 << 7`) instead — libxkbcommon's legacy 8-modifier ordering
+  (Shift/Lock/Control/Mod1/Mod2/Mod3/Mod4/Mod5 = bits 0-7) makes this a
+  fixed, reliable bit position for any keymap using `ralt_switch`, no need
+  to query the compiled keymap for it.
+
+If a different layout's AltGr level doesn't work even with this fix in
+place, check that layout's own XKB data for what it actually binds Right
+Alt to (`ralt_switch` is the near-universal xkeyboard-config default, but
+not guaranteed) before assuming the bit position is wrong.
+
+### NumLock: don't forward Windows' keypress, don't trust either side's state
+
+Numpad digit/operator keys are dual-function purely based on whichever
+*receiving* side currently has NumLock locked — Windows' own NumLock state
+is never communicated over the wire at all (Mouse Without Borders' wire
+protocol has no field for it; a Keyboard packet is just a raw VK+flags per
+keystroke). Forwarding Windows' NumLock keypress as a literal key event
+does toggle this machine's own NumLock lock-state (the compiled keymap's
+NumLock key has a `LockMods` action that Hyprland's own `xkb_state`
+processes automatically on any raw keypress, virtual or real) — but that
+lock-state is now unsynchronized with Windows', discovered directly:
+testing the NumLock key once flipped this machine's lock-state off,
+silently turning every numpad digit into a navigation key (Home/End/
+arrows/etc.) instead, with no error anywhere. **Fix** (`daemon.rs`): don't
+forward the raw NumLock keypress at all, and instead force NumLock-locked
+(`1 << 4`, XKB's conventional Mod2) via the virtual keyboard's
+`modifiers()` call on every numpad key event — so the two sides' NumLock
+state never needs to be tracked, toggled, or agree at all.
+
 ## One environment quirk worth knowing if the systemd unit ever needs debugging
 
 `daemon.rs` runs as a systemd `--user` service (see `../README.md` for

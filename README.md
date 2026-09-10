@@ -122,6 +122,38 @@ Confirmed live: the detection only checks that `Win` and `L` both appear
 (down and up) within the burst, not the full combo, so it doesn't matter
 if your configured combo adds other modifiers on top of those two.
 
+## Optional: dismiss the screensaver on mouse movement
+
+By default, Omarchy's screensaver (the decorative `ttfx` terminal animation,
+`org.omarchy.screensaver` — **not** the actual authenticated lock screen,
+which is unaffected) only dismisses on a keypress or a window-focus change,
+not on raw cursor movement. That's a rough edge for this bridge's whole
+point: control usually arrives here as a cursor move, with no keyboard
+involved at all, so the screensaver could sit there indefinitely even while
+you're actively mousing around.
+
+An optional patch for this lives in [`screensaver-mouse-wake/`](screensaver-mouse-wake/)
+in this repo. It's not installed automatically (unlike the daemon/systemd
+setup above) because it edits a root-owned file from the `omarchy` package
+— install it yourself:
+
+```sh
+bash screensaver-mouse-wake/install.sh
+```
+
+This will ask for your `sudo` password once. What it does:
+- Patches `/usr/bin/omarchy-screensaver` to poll the cursor position a few
+  times a second and dismiss as soon as it moves, in addition to the
+  existing keyboard/focus checks.
+- Symlinks `screensaver-mouse-wake/reapply.sh` into
+  `~/.config/omarchy/hooks/post-update.d/`, so a future `omarchy update`
+  that overwrites this file gets the patch reapplied automatically —
+  **but only if the installed file still exactly matches the unpatched
+  version this patch was built against** (`screensaver-mouse-wake/orig.sh`).
+  If Omarchy has changed the script in some other way by then, it backs off
+  and sends you a notification instead of blindly overwriting an unrelated
+  upstream change.
+
 ## Install
 
 1. Install the plugin, either way:

@@ -88,9 +88,16 @@ const WM_RBUTTONUP: u32 = 0x0205;
 const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
 const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_XBUTTONDOWN: u32 = 0x020B;
+const WM_XBUTTONUP: u32 = 0x020C;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
+// Standard Linux evdev "side"/"extra" buttons — the conventional back/
+// forward mapping used by browsers and file managers alike.
+const BTN_SIDE: u32 = 0x113;
+const BTN_EXTRA: u32 = 0x114;
 // LLKHF_UP: bit 7 of a low-level-keyboard-hook's flags marks a key-up event.
 const LLKHF_UP: u32 = 0x80;
 
@@ -213,6 +220,26 @@ fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32) {
             let delta = m3 as i32 as i16 as f64;
             wl.scroll_vertical(-delta);
         }
+        WM_MOUSEHWHEEL => {
+            // Same signed-16-bit-in-m3 shape as WM_MOUSEWHEEL (confirmed
+            // from real MWB's own InputHook.cs: WheelDelta is set from the
+            // same HIWORD(MouseData) read for every mouse message, not
+            // just WM_MOUSEWHEEL). Windows: positive = right; Wayland
+            // horizontal-scroll: positive = right too, no sign flip needed.
+            let delta = m3 as i32 as i16 as f64;
+            wl.scroll_horizontal(delta);
+        }
+        // Real MWB (per InputHook.cs, confirmed from source): every mouse
+        // message's WheelDelta slot (here, m3) is set from HIWORD(MouseData)
+        // regardless of message type — for WM_MOUSEWHEEL that's the scroll
+        // delta, but for WM_XBUTTONDOWN/UP it's *which* extra button
+        // (XBUTTON1=1, XBUTTON2=2), per the Win32 MSLLHOOKSTRUCT contract.
+        // These are standard side buttons (e.g. an MX Master's Back/
+        // Forward) that a real low-level mouse hook — and so real MWB —
+        // captures just fine; this daemon just never had a mapping for
+        // them until now.
+        WM_XBUTTONDOWN => wl.button(if m3 == 2 { BTN_EXTRA } else { BTN_SIDE }, true),
+        WM_XBUTTONUP => wl.button(if m3 == 2 { BTN_EXTRA } else { BTN_SIDE }, false),
         _ => {}
     }
 }

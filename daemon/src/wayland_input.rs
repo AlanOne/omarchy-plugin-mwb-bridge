@@ -227,6 +227,14 @@ impl WaylandInput {
         self.flush();
     }
 
+    /// Horizontal scroll (a wheel's side-to-side tilt, e.g. MX Master's
+    /// thumb wheel) — same units/semantics as `scroll_vertical`.
+    pub fn scroll_horizontal(&mut self, value: f64) {
+        self.pointer.axis(now_ms(), wl_pointer::Axis::HorizontalScroll, value);
+        self.pointer.frame();
+        self.flush();
+    }
+
     /// `evdev_code` is the Linux evdev keycode (e.g. KEY_A = 30) — NOT the
     /// XKB keycode (which is evdev + 8).
     pub fn key(&mut self, evdev_code: u32, pressed: bool) {

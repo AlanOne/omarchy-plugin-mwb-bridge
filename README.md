@@ -8,10 +8,12 @@ software-KVM setup, without going through any of the mainstream tools
 Hyprland because `xdg-desktop-portal-hyprland` doesn't implement the
 `RemoteDesktop` portal they all depend on.
 
-**Status: working end-to-end.** Mouse (movement, clicks, scroll) and
-keyboard both forward, via either edge-crossing or the `Ctrl+Alt+F1`-style
-hotkey switch, plain-text and image clipboard content syncs both ways
-automatically, copying a file on Windows makes it pasteable here too,
+**Status: working end-to-end.** Mouse (movement, left/right/middle clicks,
+extra side buttons like a Logitech MX Master's back/forward, vertical and
+horizontal scroll) and keyboard both forward, via either edge-crossing or
+the `Ctrl+Alt+F1`-style hotkey switch, plain-text and image clipboard
+content syncs both ways automatically, copying a file on Windows makes it
+pasteable here too,
 double-tapping Windows' own lock hotkey locks this machine too, and it runs
 as an auto-starting, auto-reconnecting systemd user service. See **Known
 bugs** below for current rough edges.
@@ -229,7 +231,8 @@ by hand works just as well as using the popup:
   "machine_name": "pick a name for this machine, e.g. its hostname",
   "machine_id": 987654321,
   "xkb_layout": "the XKB layout this machine's keyboard actually uses, e.g. us",
-  "xkb_variant": ""
+  "xkb_variant": "",
+  "scroll_speed": 1.0
 }
 ```
 
@@ -249,6 +252,12 @@ by hand works just as well as using the popup:
   doesn't guarantee correct typing on every layout.
 - The file contains the shared key in plaintext — keep it `chmod 600`
   (the plugin does this after every save).
+- `scroll_speed` is a plain multiplier on both vertical and horizontal
+  scroll, default `1.0` (missing entirely on an older config defaults to
+  the same). The baseline it multiplies already corrects for Windows'
+  wheel-delta units being ~8x larger than what Wayland's virtual-pointer
+  protocol expects — adjust this only to taste on top of that, e.g. `0.8`
+  for a bit slower.
 
 The daemon also writes live connection status to
 `~/.local/share/omarchy-mwb-bridge/status.json` (`{connected, peer, detail,

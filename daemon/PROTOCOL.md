@@ -128,6 +128,44 @@ machines use large effectively-random-looking persisted values (e.g. real
 type with the `Matrix` (128) bit set. Everything else (`Mouse=123`,
 `Keyboard=122`, `Hi=2`, `ByeBye=4`, ...) is a plain 32-byte package.
 
+### Mouse packet: dwFlags is the raw `WM_*` message, WheelDelta doubles as XBUTTON-which
+
+Confirmed 2026-09-10 by reading real MWB's `InputHook.cs`/`WM.cs` (`v0.98.1`) directly, after Alan
+found his MX Master 3's extra side buttons weren't registering. `MouseHookProc` applies **no
+message-type filtering** at all beyond a couple of unrelated `WM_LBUTTONUP`-skip special cases —
+every `WH_MOUSE_LL` message reaches the wire, including `WM_XBUTTONDOWN`/`WM_XBUTTONUP` (0x20B/
+0x20C — standard side/back-forward buttons) and `WM_MOUSEHWHEEL` (0x20E — horizontal tilt-scroll).
+None of these were ever an MWB-side limitation.
+
+The non-obvious part: `hookCallbackMouseData.WheelDelta` (this repo's Machine3/`m3`) is set from
+`HIWORD(MouseData)` for **every** mouse message, not just `WM_MOUSEWHEEL` — real source comment:
+"Use WheelDelta to store XBUTTON1/XBUTTON2 data." So for `WM_XBUTTONDOWN`/`UP`, that same field
+carries *which* extra button fired (`XBUTTON1=1`, `XBUTTON2=2`), per the Win32
+`MSLLHOOKSTRUCT.mouseData` contract — not a dedicated field, just double duty on the wheel slot.
+This daemon maps `m3==2` to `BTN_EXTRA` (0x114) and anything else to `BTN_SIDE` (0x113), the
+conventional Linux evdev back/forward codes.
+
+**A real vendor-driver edge case, not confirmed either way**: if a mouse has a button beyond the
+two standard side buttons (e.g. Logitech's dedicated "Gesture Button" on the MX Master line, used
+for Options/Options+'s modal flick-gesture feature), `WH_MOUSE_LL` only ever sees the fixed set of
+standard Win32 mouse messages — a vendor button not mapped to one of those (handled instead via
+the vendor's own HID++-level driver software) would be invisible to real MWB too, not just this
+reimplementation. Same class of limitation as the native `Win+L` finding under **Locking both
+machines** below.
+
+### Scroll units: Wayland's `axis` value is not Windows' `WHEEL_DELTA`
+
+Confirmed 2026-09-10 by reading `wlr-virtual-pointer-unstable-v1.xml` directly (Alan reported one
+wheel notch scrolling far too much). Windows reports one wheel "click" as `WHEEL_DELTA = 120`,
+carried as `WheelDelta` (Machine3) for `WM_MOUSEWHEEL`/`WM_MOUSEHWHEEL`. The wlr-virtual-pointer
+protocol's `axis` request, though, documents its `value` as "length of vector in touchpad
+coordinates" — a real wheel's libinput driver reports roughly **15** per click in that same unit,
+nothing like 120. Forwarding Windows' raw value straight through (this daemon's original
+behavior, since the first mouse-wheel implementation) overscrolled by roughly 8x. Fixed with a
+`120 -> 15` baseline conversion in `daemon.rs` (`SCROLL_UNITS_PER_WHEEL_CLICK`), plus a
+`scroll_speed` config multiplier (default `1.0`) on top for per-device/per-taste tuning — see
+README's **Config files** section.
+
 ## PackageType enum
 
 ```
@@ -192,9 +230,11 @@ every packet**, not just the first one.
 - `Common.MachineID`-style real ID usage (after fixing the `Src=0` bug).
 - **Real Mouse and Keyboard forwarding, both directions of trust** (edge-
   crossing *and* the `Ctrl+Alt+F1`-style hotkey switch), fully working
-  end-to-end: cursor movement, clicks, scroll wheel, and typing (including
-  modifier keys) all land correctly on the Linux side. See below for what
-  it actually took to get here — none of it was in the wire protocol.
+  end-to-end: cursor movement, left/right/middle clicks, extra side buttons
+  (a mouse's back/forward), vertical and horizontal scroll wheel (correctly
+  scaled — see below), and typing (including modifier keys) all land
+  correctly on the Linux side. See below for what it actually took to get
+  here — none of it was in the wire protocol.
 - **Clipboard sync, both directions, text and images, both size paths**
   (see below) — plain text and clipboard images (screenshots, "copy image"
   with no file involved) both sync automatically either direction, small

@@ -238,6 +238,7 @@ BarWidget {
         keyField.text = String(c.security_key || "")
         ipField.text = String(c.windows_ip || "")
         nameField.text = String(c.machine_name || "")
+        scrollField.text = String(c.scroll_speed !== undefined ? c.scroll_speed : 1.0)
         var id = Number(c.machine_id)
         if (id) root.machineId = id
         // Fallback only — detectXkbLayout() (already running from
@@ -254,13 +255,15 @@ BarWidget {
   }
 
   function saveSettings() {
+    var parsedScroll = Number(scrollField.text)
     var cfg = {
       security_key: keyField.text,
       windows_ip: ipField.text.trim(),
       machine_name: nameField.text.trim(),
       machine_id: root.machineId,
       xkb_layout: root.detectedXkbLayout,
-      xkb_variant: root.detectedXkbVariant
+      xkb_variant: root.detectedXkbVariant,
+      scroll_speed: (parsedScroll > 0 ? parsedScroll : 1.0)
     }
     configFile.setText(JSON.stringify(cfg, null, 2) + "\n")
     chmodProc.running = true
@@ -522,6 +525,12 @@ BarWidget {
         color: Qt.darker(root.bar.foreground, 1.4)
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
+      }
+
+      TextField {
+        id: scrollField
+        width: parent.width
+        placeholderText: "Scroll speed multiplier (default 1.0)"
       }
 
       Text {

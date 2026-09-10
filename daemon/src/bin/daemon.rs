@@ -192,7 +192,19 @@ impl ModState {
     }
 }
 
-fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32) {
+// Windows reports one wheel "click" as WHEEL_DELTA = 120 (WM_MOUSEWHEEL's
+// HIWORD), but the wlr-virtual-pointer protocol's `axis` value is documented
+// as "length of vector in touchpad coordinates" — a completely different
+// unit, closer to the handful-of-pixels a real wheel's libinput driver
+// reports per click (empirically, around 15). Forwarding Windows' raw 120
+// straight through (this daemon's original behavior) overscrolls by roughly
+// 8x — confirmed by Alan actually feeling it ("a single scroll moves the
+// page too much"). This baseline converts one Windows click into one
+// conventional ~15-unit click; `scroll_speed` (config.json, user-tunable
+// through the plugin's settings popup) multiplies on top of that for taste.
+const SCROLL_UNITS_PER_WHEEL_CLICK: f64 = 15.0 / 120.0;
+
+fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32, scroll_speed: f64) {
     match flags {
         WM_MOUSEMOVE => {
             // Observed in real traffic (likely an edge-crossing overshoot):
@@ -213,12 +225,11 @@ fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32) {
         WM_MBUTTONUP => wl.button(BTN_MIDDLE, false),
         WM_MOUSEWHEEL => {
             // WheelDelta is a signed 16-bit value in Windows' usual +/-120
-            // per notch; wl_pointer.axis wants "120ths of a click"-ish
-            // units too, so pass it through with sign flipped (Windows:
-            // positive = away from user/up; Wayland vertical-scroll:
-            // positive = down) — matches physical scroll-wheel direction.
+            // per notch. Sign flipped (Windows: positive = away from user/
+            // up; Wayland vertical-scroll: positive = down) — matches
+            // physical scroll-wheel direction.
             let delta = m3 as i32 as i16 as f64;
-            wl.scroll_vertical(-delta);
+            wl.scroll_vertical(-delta * SCROLL_UNITS_PER_WHEEL_CLICK * scroll_speed);
         }
         WM_MOUSEHWHEEL => {
             // Same signed-16-bit-in-m3 shape as WM_MOUSEWHEEL (confirmed
@@ -227,7 +238,7 @@ fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32) {
             // just WM_MOUSEWHEEL). Windows: positive = right; Wayland
             // horizontal-scroll: positive = right too, no sign flip needed.
             let delta = m3 as i32 as i16 as f64;
-            wl.scroll_horizontal(delta);
+            wl.scroll_horizontal(delta * SCROLL_UNITS_PER_WHEEL_CLICK * scroll_speed);
         }
         // Real MWB (per InputHook.cs, confirmed from source): every mouse
         // message's WheelDelta slot (here, m3) is set from HIWORD(MouseData)
@@ -856,7 +867,7 @@ fn run_session(
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(w) = wl.as_deref_mut() {
                     println!(">>> MOUSE x={x} y={y} wheel={wheel} flags=0x{flags:x}");
-                    handle_mouse(w, x, y, wheel, flags);
+                    handle_mouse(w, x, y, wheel, flags, cfg.scroll_speed);
                 }
             }
             PACKAGE_TYPE_KEYBOARD => {

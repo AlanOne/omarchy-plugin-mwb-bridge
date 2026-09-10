@@ -26,10 +26,21 @@ pub struct Config {
     pub xkb_layout: String,
     #[serde(default)]
     pub xkb_variant: String,
+    // Multiplier applied to every scroll-wheel event (vertical and
+    // horizontal) before forwarding — see handle_mouse's own comment for why
+    // one's needed at all: Wayland's virtual-pointer axis value isn't in the
+    // same units as Windows' WHEEL_DELTA, so a fixed baseline conversion is
+    // applied first, then this multiplier on top for the user to taste.
+    #[serde(default = "default_scroll_speed")]
+    pub scroll_speed: f64,
 }
 
 fn default_xkb_layout() -> String {
     "us".to_string()
+}
+
+fn default_scroll_speed() -> f64 {
+    1.0
 }
 
 #[derive(Serialize)]

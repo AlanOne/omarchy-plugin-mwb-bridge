@@ -743,6 +743,37 @@ forward the raw NumLock keypress at all, and instead force NumLock-locked
 `modifiers()` call on every numpad key event — so the two sides' NumLock
 state never needs to be tracked, toggled, or agree at all.
 
+## Suspend/resume: reconnecting fast instead of waiting out `SOCKET_TIMEOUT`
+
+A laptop suspend leaves the live TCP connection to Windows silently dead for
+the whole sleep duration (no FIN/RST — the kernel just stops), and a read
+timeout's clock only really starts ticking down again after resume, since it
+doesn't fire while the machine itself is suspended. Confirmed live: a
+46-minute suspend meant the daemon sat on the dead connection for another
+~5.5 minutes *after* waking before `SOCKET_TIMEOUT` (300s) finally noticed
+and reconnected on its own — a real "control doesn't work" window every time
+the laptop sleeps.
+
+Fixed with `run_resume_watcher` (`daemon.rs`): an unprivileged subscription
+to logind's `PrepareForSleep` signal on the system bus via `dbus-monitor`
+(the same mechanism Omarchy's own pre-suspend lock monitor,
+`omarchy-system-sleep-monitor`, already uses — no root needed). The signal
+fires twice, `true` right before suspending and `false` right after
+resuming; only the resume edge matters (forcing a reconnect before suspend
+would just reconnect into a connection about to die anyway). On resume, it
+force-closes ("`shutdown(Shutdown::Both)`") a clone of the client
+connection's live `TcpStream` (published into a shared `Arc<Mutex<Option
+<TcpStream>>>` by `run_client`), which makes the blocked read in
+`run_session` return an EOF error immediately — the main loop's existing
+"log it, sleep 3s, reconnect" handling already deals with that correctly, no
+new error handling needed. If the network itself isn't back up yet, the
+retry's own `TcpStream::connect` just fails and the normal 3s retry loop
+keeps going.
+
+Best-effort: if `dbus-monitor` can't be spawned at all, this logs once and
+returns — suspend/resume falls back to plain `SOCKET_TIMEOUT` behavior,
+same as before this existed.
+
 ## One environment quirk worth knowing if the systemd unit ever needs debugging
 
 `daemon.rs` runs as a systemd `--user` service (see `../README.md` for

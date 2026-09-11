@@ -4,8 +4,8 @@
 // PROTOCOL.md for the wire protocol this implements.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -1123,17 +1123,87 @@ fn run_file_server_listener(cfg: Config, pending: Arc<Mutex<Option<PendingOutbou
 /// Outbound leg: connects to Windows' message server and injects decoded
 /// Mouse/Keyboard into Wayland. This is the connection real input forwarding
 /// (and outbound clipboard sync) runs over.
+///
+/// Publishes a clone of the live stream into `current_stream` for the
+/// resume-watcher thread to shut down on demand (see `run_resume_watcher`) —
+/// cleared again once this session ends for any reason, so the watcher never
+/// shuts down a stale, already-dead connection.
 fn run_client(
     cfg: &Config,
     wl: &mut WaylandInput,
     clipboard_rx: &Receiver<ClipboardEvent>,
     shared: &ClipboardShared,
+    current_stream: &Arc<Mutex<Option<TcpStream>>>,
 ) -> std::io::Result<()> {
     println!("Connecting to {}...", cfg.windows_ip);
     config::write_status(false, "", "Connecting...");
     let stream = TcpStream::connect(&cfg.windows_ip)?;
     set_socket_timeouts(&stream);
-    run_session(stream, Some(wl), "client", cfg, Some(clipboard_rx), shared)
+    if let Ok(clone) = stream.try_clone() {
+        *current_stream.lock().unwrap() = Some(clone);
+    }
+    let result = run_session(stream, Some(wl), "client", cfg, Some(clipboard_rx), shared);
+    *current_stream.lock().unwrap() = None;
+    result
+}
+
+/// Watches logind's `PrepareForSleep` signal on the system bus — an
+/// unprivileged read-only subscription, the same mechanism Omarchy's own
+/// pre-suspend lock monitor (`omarchy-system-sleep-monitor`) already uses, so
+/// no root/setup beyond `dbus-monitor` being installed (it already is, as an
+/// Omarchy dependency).
+///
+/// Why this exists: a laptop suspend leaves the live TCP connection to
+/// Windows silently dead for the entire sleep duration (no FIN/RST — the
+/// kernel just stops), and `SOCKET_TIMEOUT`'s clock only really starts
+/// ticking down after resume, since read timeouts don't fire while the
+/// machine itself is suspended. Confirmed live: a 46-minute suspend meant
+/// ~5.5 more minutes of "control doesn't work" after waking before the
+/// existing timeout noticed and reconnected on its own. `PrepareForSleep`
+/// fires twice — `true` right before suspending, `false` right after
+/// resuming — only the resume edge matters here: forcing a reconnect before
+/// suspend would just reconnect into a connection that's about to die
+/// anyway. On resume, force-closing the tracked stream makes the blocked
+/// read in `run_session` return an EOF error immediately, which the main
+/// loop's existing "log it, sleep 3s, reconnect" handling already deals
+/// with — no new error handling needed, just making the existing reconnect
+/// happen right away instead of up to `SOCKET_TIMEOUT` later. If the network
+/// itself isn't back up yet, `run_client`'s own `TcpStream::connect` simply
+/// fails and the normal 3s retry loop keeps trying, same as any other
+/// reconnect.
+///
+/// Best-effort: if `dbus-monitor` can't be spawned (missing binary, no
+/// system bus), this just logs once and returns — suspend/resume falls back
+/// to the plain `SOCKET_TIMEOUT` behavior, exactly as before this existed.
+fn run_resume_watcher(current_stream: Arc<Mutex<Option<TcpStream>>>) {
+    let mut child = match Command::new("dbus-monitor")
+        .args([
+            "--system",
+            "type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[resume-watch] Couldn't start dbus-monitor ({e}) — suspend/resume will fall back to the {}s socket timeout.",
+                SOCKET_TIMEOUT.as_secs()
+            );
+            return;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else { return };
+    println!("[resume-watch] Watching logind for suspend/resume.");
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if line.contains("boolean false") {
+            if let Some(stream) = current_stream.lock().unwrap().as_ref() {
+                println!("[resume-watch] Resumed from suspend — forcing an immediate reconnect instead of waiting out the socket timeout.");
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
 }
 
 /// Inbound leg: accepts Windows' own outbound connection back to us (the
@@ -1207,8 +1277,14 @@ fn main() {
         std::thread::spawn(move || run_clipboard_watcher(clip_tx, shared));
     }
 
+    let current_stream: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+    {
+        let current_stream = current_stream.clone();
+        std::thread::spawn(move || run_resume_watcher(current_stream));
+    }
+
     loop {
-        if let Err(e) = run_client(&cfg, &mut wl, &clip_rx, &clipboard_shared) {
+        if let Err(e) = run_client(&cfg, &mut wl, &clip_rx, &clipboard_shared, &current_stream) {
             eprintln!("Connection ended: {e}. Reconnecting in 3s...");
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
         }

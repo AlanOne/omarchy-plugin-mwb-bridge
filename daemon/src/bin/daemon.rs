@@ -3,7 +3,7 @@
 // feeds decoded Mouse/Keyboard packets into the Wayland injector. See
 // PROTOCOL.md for the wire protocol this implements.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -255,7 +255,13 @@ fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32, sc
     }
 }
 
-fn handle_keyboard(wl: &mut WaylandInput, mods: &mut ModState, vk: u32, flags: u32) {
+fn handle_keyboard(
+    wl: &mut WaylandInput,
+    mods: &mut ModState,
+    pressed_keys: &mut HashSet<u32>,
+    vk: u32,
+    flags: u32,
+) {
     // Windows' own NumLock state and this machine's are two independent,
     // unsynchronized locks. Forwarding the raw NumLock keypress toggles our
     // side's lock-state via the compositor's own keymap-driven handling —
@@ -278,6 +284,25 @@ fn handle_keyboard(wl: &mut WaylandInput, mods: &mut ModState, vk: u32, flags: u
         wl.modifiers(mods.depressed, 0, 0, 0);
     } else if (0x60..=0x6F).contains(&vk) {
         wl.modifiers(mods.depressed, 0, LOCK_NUMLOCK, 0);
+    }
+
+    // Windows forwards its own OS-level auto-repeat "down" messages for a
+    // held key -- a real, expected part of the wire protocol, not a bug on
+    // its end. Only forward the actual press/release *transition* to the
+    // compositor; a held key generating repeat characters is Hyprland's own
+    // repeat timer's job once it sees the first press, same as a real local
+    // keyboard (whose evdev driver never re-sends "pressed" for a key
+    // that's still down either). Forwarding every one of Windows' repeat
+    // packets as a fresh press compounded with Hyprland's own repeat,
+    // producing far more characters than intended for any key held even
+    // slightly too long. Releases always forward regardless of tracked
+    // state, so a missed/out-of-order press can never leave a key stuck.
+    if pressed {
+        if !pressed_keys.insert(evdev_code) {
+            return;
+        }
+    } else {
+        pressed_keys.remove(&evdev_code);
     }
     wl.key(evdev_code, pressed);
 }
@@ -766,6 +791,19 @@ fn run_session(
     println!("[{role}] Handshake sent, entering receive loop.");
 
     let mut mods = ModState::new();
+    // Windows forwards its own OS-level auto-repeat keydowns for a held key
+    // (confirmed empirically: 756 same-key "down" packets with no
+    // intervening "up" logged over one day of normal use, heavily on held
+    // navigation keys). handle_keyboard used to forward every one of those
+    // as a fresh wl_keyboard press, on top of whatever repeat Hyprland's own
+    // compositor-side repeat timer *also* generates once it sees the first
+    // press -- two independent repeat sources compounding, producing way
+    // more characters than intended for any key held even slightly too long
+    // (e.g. "channnnnnnnnnnnnnnnnnnge" for a normal fast keypress). Tracks
+    // which evdev keys are currently down so only the actual press/release
+    // transition gets forwarded, matching how a real local keyboard's evdev
+    // driver behaves (one press event; the compositor handles repetition).
+    let mut pressed_keys: HashSet<u32> = HashSet::new();
     let mut lock_combo = LockComboDetector::new();
     let mut hi_count = 0u64;
     let mut clipboard_buf: Vec<u8> = Vec::new();
@@ -881,7 +919,7 @@ fn run_session(
                 }
                 if let Some(w) = wl.as_deref_mut() {
                     println!(">>> KEYBOARD vk=0x{vk:x} flags=0x{flags:x}");
-                    handle_keyboard(w, &mut mods, vk, flags);
+                    handle_keyboard(w, &mut mods, &mut pressed_keys, vk, flags);
                 }
             }
             PACKAGE_TYPE_CLIPBOARD_TEXT | PACKAGE_TYPE_CLIPBOARD_IMAGE => {

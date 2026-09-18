@@ -9,7 +9,17 @@
 # same directory, so it runs automatically after every `omarchy update`.
 set -euo pipefail
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# readlink -f resolves the symlink chain first -- omarchy-hook invokes this
+# script via the post-update.d/*.hook symlink pointing here, and plain
+# `dirname "${BASH_SOURCE[0]}"` (without resolving that symlink first) would
+# otherwise resolve to the *hooks* directory instead of this one, silently
+# breaking every check below (confirmed live 2026-09-18: this exact bug was
+# why the patch never actually got reapplied after an omarchy update reverted
+# it -- $DIR/orig.sh didn't exist, cmp failed, and the "changed upstream in a
+# way this patch doesn't recognize" branch fired every time instead of the
+# real reapply logic, with nobody noticing because that notification's
+# wording didn't point at the actual cause).
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 TARGET=/usr/bin/omarchy-screensaver
 
 [[ -f $TARGET ]] || exit 0

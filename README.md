@@ -147,6 +147,28 @@ This will ask for your `sudo` password once. What it does:
   and sends you a notification instead of blindly overwriting an unrelated
   upstream change.
 
+### Optional: make the reapply fully automatic (no sudo prompt)
+
+`reapply.sh` runs unattended from an update hook, so it can't prompt for
+your password — by default, if an update reverts the file, it'll detect
+that correctly but only get as far as sending you a notification asking you
+to run the install command yourself. To let it actually reapply itself
+silently, grant passwordless `sudo` for **exactly this one command**
+(nothing broader):
+
+```sh
+echo 'YOUR_USERNAME ALL=(root) NOPASSWD: /usr/bin/install -m 755 /path/to/this/repo/screensaver-mouse-wake/patched.sh /usr/bin/omarchy-screensaver' \
+  | sudo tee /etc/sudoers.d/mwb-screensaver-patch
+sudo chmod 440 /etc/sudoers.d/mwb-screensaver-patch
+sudo visudo -c   # validates syntax before trusting it
+```
+
+Replace `YOUR_USERNAME` and the repo path with your actual values (both
+`reapply.sh`'s own `sudo -n install ...` call and this sudoers rule need to
+reference the same real, resolved path this repo is checked out at — if you
+ever move the checkout, update both). `visudo -c` at the end catches a typo
+before it can break `sudo` entirely.
+
 ## Install
 
 1. Install the plugin, either way:

@@ -1,19 +1,20 @@
-// macOS port of the mwb-omarchy-bridge daemon — milestone 1: raw Mouse/
-// Keyboard forwarding + a minimal menu bar shell, nothing else yet.
-// Everything protocol-level (crypto, framing, handshake, VK->evdev
-// translation, mouse/keyboard decoding) is unchanged, shared code from
-// `mwb_protocol` — this file is only the platform wiring: the TCP
-// connect/reconnect loop and a status-item menu bar app. Clipboard sync,
-// lock-both-machines, file transfer, and suspend/resume handling are
-// deliberately not ported yet — see the mwb-omarchy-bridge project memory's
-// "macOS port" section for the full remaining list, being added
-// incrementally the same way the Linux build was.
+// macOS port of the mwb-omarchy-bridge daemon. Everything protocol-level
+// (crypto, framing, handshake, VK->evdev translation, mouse/keyboard
+// decoding) is unchanged, shared code from `mwb_protocol` — this file is
+// mostly platform wiring: the TCP connect/reconnect loop and a status-item
+// menu bar app. Mouse/keyboard forwarding and clipboard text sync are
+// ported; lock-both-machines, file transfer, image clipboard, and
+// suspend/resume handling are deliberately not yet — see the
+// mwb-omarchy-bridge project memory's "macOS port" section for the full
+// remaining list, being added incrementally the same way the Linux build was.
 
 mod cg_input;
+mod clipboard;
 mod keycode_macos;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use mwb_protocol::config::{self, Config};
@@ -22,6 +23,7 @@ use mwb_protocol::mwb_protocol::*;
 use rand::RngExt;
 
 use cg_input::CgInput;
+use clipboard::{ClipboardEvent, ClipboardShared};
 
 // Same 5-minute idle-tolerant timeout the Linux build settled on after
 // finding both failure modes live (a no-timeout 3+ hour hang, then an
@@ -45,14 +47,23 @@ fn set_socket_timeouts(stream: &TcpStream) {
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
 }
 
-/// Handshake + Mouse/Keyboard receive loop over an already-connected stream.
-/// `cg` is `Some` on the outbound client connection (real forwarding runs
-/// there) and `None` on the inbound reverse-listener side, which only needs
-/// to complete the protocol so Windows sees a healthy pair — mirrors the
-/// Linux build's `role`/`wl: Option<&mut WaylandInput>` split. Deliberately
-/// narrower than the Linux build otherwise: no clipboard/lock/file handling
-/// yet. Returns (via `?`) on any I/O error so the caller reconnects/re-accepts.
-fn run_session(stream: &mut TcpStream, mut cg: Option<&mut CgInput>, cfg: &Config) -> std::io::Result<()> {
+/// Handshake + Mouse/Keyboard/ClipboardText receive loop over an
+/// already-connected stream. `cg` is `Some` on the outbound client
+/// connection (real forwarding runs there) and `None` on the inbound
+/// reverse-listener side, which only needs to complete the protocol so
+/// Windows sees a healthy pair — mirrors the Linux build's `role`/
+/// `wl: Option<&mut WaylandInput>` split. `clipboard` is only `Some` on the
+/// client role too, same reasoning as the Linux build: outbound clipboard
+/// sync happens over the one connection real forwarding already runs over.
+/// Deliberately narrower than the Linux build otherwise: no image
+/// clipboard/lock/file handling yet. Returns (via `?`) on any I/O error so
+/// the caller reconnects/re-accepts.
+fn run_session(
+    stream: &mut TcpStream,
+    mut cg: Option<&mut CgInput>,
+    cfg: &Config,
+    clipboard: Option<(&Receiver<ClipboardEvent>, &ClipboardShared)>,
+) -> std::io::Result<()> {
     let magic_number = get_24bit_hash(&cfg.security_key);
     let key = derive_key(&cfg.security_key);
     let iv = derive_iv();
@@ -85,8 +96,29 @@ fn run_session(stream: &mut TcpStream, mut cg: Option<&mut CgInput>, cfg: &Confi
 
     let mut kb_state = KeyboardState::new();
     let mut hi_count = 0u64;
+    let mut clipboard_buf: Vec<u8> = Vec::new();
+    let mut clipboard_kind: Option<u8> = None;
+    // Arbitrary starting value distinct from the handshake's id=1 above —
+    // just needs to be unique per outgoing package within this connection
+    // (see build_clipboard_text_packages's doc comment on why).
+    let mut next_clip_id: u32 = 1000;
 
     loop {
+        if let Some((clip_rx, _)) = clipboard.as_ref() {
+            let mut latest = None;
+            while let Ok(ev) = clip_rx.try_recv() {
+                latest = Some(ev); // coalesce rapid successive changes to the last one
+            }
+            if let Some(ClipboardEvent::Text(text)) = latest {
+                for mut pkg in build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text) {
+                    finalize_send_buf(&mut pkg, magic_number);
+                    let ct = cipher.encrypt(&mut write_chain, &pkg);
+                    stream.write_all(&ct)?;
+                }
+                println!("[client] Sent clipboard text ({} chars) to peer.", text.chars().count());
+            }
+        }
+
         let mut ct = [0u8; PACKAGE_SIZE];
         stream.read_exact(&mut ct)?;
         let mut pt = cipher.decrypt(&mut read_chain, &ct);
@@ -142,6 +174,23 @@ fn run_session(stream: &mut TcpStream, mut cg: Option<&mut CgInput>, cfg: &Confi
                     handle_keyboard(cg, &mut kb_state, vk, flags);
                 }
             }
+            PACKAGE_TYPE_CLIPBOARD_TEXT => {
+                // Bytes 16-63 of a ClipboardText package are one contiguous
+                // 48-byte raw-data chunk (not Machine1-4 + MachineName,
+                // despite the same package size) — see PROTOCOL.md's
+                // clipboard section.
+                clipboard_buf.extend_from_slice(&full[16..64]);
+                clipboard_kind = Some(package_type);
+            }
+            PACKAGE_TYPE_CLIPBOARD_DATA_END => {
+                if clipboard_kind == Some(PACKAGE_TYPE_CLIPBOARD_TEXT) {
+                    if let Some((_, shared)) = clipboard.as_ref() {
+                        clipboard::apply_incoming_clipboard_text(&clipboard_buf, shared);
+                    }
+                }
+                clipboard_buf.clear();
+                clipboard_kind = None;
+            }
             PACKAGE_TYPE_HI => {
                 hi_count += 1;
                 if hi_count % 500 == 1 {
@@ -154,12 +203,17 @@ fn run_session(stream: &mut TcpStream, mut cg: Option<&mut CgInput>, cfg: &Confi
     }
 }
 
-fn run_client(cfg: &Config, cg: &mut CgInput) -> std::io::Result<()> {
+fn run_client(
+    cfg: &Config,
+    cg: &mut CgInput,
+    clip_rx: &Receiver<ClipboardEvent>,
+    clip_shared: &ClipboardShared,
+) -> std::io::Result<()> {
     println!("Connecting to {}...", cfg.windows_ip);
     config::write_status(false, "", "Connecting...");
     let mut stream = TcpStream::connect(&cfg.windows_ip)?;
     set_socket_timeouts(&stream);
-    run_session(&mut stream, Some(cg), cfg)
+    run_session(&mut stream, Some(cg), cfg, Some((clip_rx, clip_shared)))
 }
 
 /// Accepts Windows' own reverse connection back to us — see `LISTEN_PORT`'s
@@ -182,7 +236,7 @@ fn run_server_listener(cfg: Config) {
                 set_socket_timeouts(&stream);
                 let cfg = cfg.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = run_session(&mut stream, None, &cfg) {
+                    if let Err(e) = run_session(&mut stream, None, &cfg, None) {
                         eprintln!("[server] Session ended: {e}");
                     }
                 });
@@ -198,12 +252,19 @@ fn network_thread(cfg: Config) {
         std::thread::spawn(move || run_server_listener(cfg));
     }
 
+    let clip_shared = ClipboardShared::new();
+    let (clip_tx, clip_rx) = mpsc::channel::<ClipboardEvent>();
+    {
+        let clip_shared = clip_shared.clone();
+        std::thread::spawn(move || clipboard::run_clipboard_watcher(clip_tx, clip_shared));
+    }
+
     // CGEventSource/CGEvent creation doesn't require the main thread —
     // unlike the menu bar UI, which tao/AppKit does require there — so this
     // runs entirely on its own background thread.
     let mut cg = CgInput::new();
     loop {
-        if let Err(e) = run_client(&cfg, &mut cg) {
+        if let Err(e) = run_client(&cfg, &mut cg, &clip_rx, &clip_shared) {
             eprintln!("Connection ended: {e}. Reconnecting in 3s...");
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
         }

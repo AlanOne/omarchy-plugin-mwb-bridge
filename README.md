@@ -76,11 +76,26 @@ bugs** below for current rough edges.
 
 ## macOS
 
-**Status: mouse + keyboard forwarding working end-to-end, packaged as a
-proper autostarting `.app`, both live-tested against a real Windows PC.**
-Not yet ported: clipboard sync, lock-both-machines, file transfer,
-suspend/resume handling. Horizontal scroll's sign isn't independently
-confirmed yet (only vertical was live-tested).
+**Status: mouse + keyboard forwarding and clipboard text sync (both
+directions) working end-to-end, packaged as a proper autostarting `.app`,
+all live-tested against a real Windows PC.** Not yet ported: clipboard
+images, file transfer, lock-both-machines, suspend/resume handling.
+Horizontal scroll's sign isn't independently confirmed yet (only vertical
+was live-tested).
+
+**TODO: menu bar icon.** Currently a plain white square placeholder
+(`macos/src/tray.rs`'s `placeholder_icon`) — needs a real designed icon.
+
+**Gotcha: every rebuild needs the Accessibility grant fully redone, not
+just toggled.** Ad-hoc code signing (see `install.sh`'s comment) means each
+`install.sh` re-run produces a binary with a different signature. Confirmed
+live: after a rebuild, mouse/keyboard forwarding silently stopped working
+(no error — matches the general "CGEventPost silently does nothing without
+permission" behavior) even though the app was still listed and toggled on
+in System Settings > Privacy & Security > Accessibility. Toggling it
+off/on did **not** fix it; removing it entirely (`−` button) and re-adding
+it (`+`, browse to the app) did. Do this after every reinstall until a
+stable self-signed cert replaces ad-hoc signing.
 
 Requires **Accessibility permission** (System Settings > Privacy &
 Security > Accessibility) granted to the running binary — `CGEventPost`

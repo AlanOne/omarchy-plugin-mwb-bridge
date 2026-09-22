@@ -54,10 +54,15 @@ Installed to: $APP_DIR
 LaunchAgent:  $PLIST_PATH
 Logs:         $LOG_DIR/
 
-IMPORTANT — first run needs a manual permission grant:
-Open System Settings > Privacy & Security > Accessibility, and add/enable
-"$APP_NAME" (browse to $APP_DIR if it's not listed yet). CGEventPost
-silently does nothing until this is granted — no error, no crash, input
-just won't forward. After granting it, restart the app:
+IMPORTANT — every install/reinstall needs a manual permission step:
+Open System Settings > Privacy & Security > Accessibility. CGEventPost
+silently does nothing without this grant — no error, no crash, input just
+won't forward.
+  - First install: add "$APP_NAME" (+ button, browse to $APP_DIR).
+  - Reinstall (after this script rebuilds a new binary): ad-hoc signing
+    means the signature changed, and confirmed live, just toggling the
+    existing entry off/on does NOT restore trust — remove it entirely
+    (− button) and re-add it (+ button) instead.
+Then restart the app:
   launchctl kickstart -k gui/\$(id -u)/$BUNDLE_ID
 EOF

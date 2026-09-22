@@ -11,3 +11,5 @@ core-foundation = "0.10"
 tray-icon = "0.19"
 muda = "0.15"
 tao = "0.30"
+arboard = "3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

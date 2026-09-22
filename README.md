@@ -92,16 +92,21 @@ no longer the plain placeholder square either. The app is menu-bar-only
 confirmed live that `LSUIElement` alone isn't enough, since tao's own
 `NSApplication` setup defaults to the Regular policy regardless.
 
-**Gotcha: every rebuild needs the Accessibility grant fully redone, not
-just toggled.** Ad-hoc code signing (see `install.sh`'s comment) means each
-`install.sh` re-run produces a binary with a different signature. Confirmed
-live: after a rebuild, mouse/keyboard forwarding silently stopped working
-(no error — matches the general "CGEventPost silently does nothing without
-permission" behavior) even though the app was still listed and toggled on
-in System Settings > Privacy & Security > Accessibility. Toggling it
-off/on did **not** fix it; removing it entirely (`−` button) and re-adding
-it (`+`, browse to the app) did. Do this after every reinstall until a
-stable self-signed cert replaces ad-hoc signing.
+**Fixed: Accessibility grant now survives rebuilds.** Originally signed
+ad-hoc (`codesign --sign -`), which derives its "identity" from the
+binary's own hash — confirmed live that this broke mouse/keyboard
+forwarding silently (no error) after every single rebuild, and even
+toggling the existing Accessibility entry off/on didn't fix it, only fully
+removing and re-adding it did. Fixed by generating a stable local
+self-signed code-signing certificate (`install.sh` does this automatically
+on first run — `security find-certificate`/`openssl req`/`security
+import`, entirely scripted, no Keychain Access GUI needed) and signing
+with that instead. Confirmed live, 2026-09-22: rebuilt with a real source
+change, Accessibility kept working with zero manual steps. Two one-time
+exceptions (both already behind you after the first install with this
+identity): switching an existing ad-hoc install over needs one manual
+re-grant, and the very first time `codesign` uses the new certificate's
+private key, macOS may show a one-time keychain password prompt.
 
 Requires **Accessibility permission** (System Settings > Privacy &
 Security > Accessibility) granted to the running binary — `CGEventPost`

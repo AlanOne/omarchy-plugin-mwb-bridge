@@ -16,6 +16,7 @@ APP_DIR="$HOME/Applications/$APP_NAME"
 BUNDLE_ID="com.alanone.mwb-mac-bridge"
 PLIST_PATH="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 LOG_DIR="$HOME/Library/Logs/mwb-mac-bridge"
+CERT_NAME="mwb-mac-bridge-dev"
 
 echo "==> Building release binary..."
 ( cd "$DAEMON_DIR" && cargo build --release -p mwb_mac_bridge )
@@ -30,15 +31,33 @@ mkdir -p "$APP_DIR/Contents/MacOS"
 cp "$SCRIPT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/mwb_mac_bridge"
 
-echo "==> Ad-hoc code signing (no Apple Developer account needed for local use)..."
-# Ad-hoc (`-`) signing gives the bundle a stable enough identity for one
-# install, but its hash changes on every rebuild — macOS may ask you to
-# re-grant Accessibility after reinstalling a new build. If that gets
-# annoying, replace this with a self-signed code-signing certificate from
-# Keychain Access (Certificate Assistant > Create a Certificate > Code
-# Signing) and `--sign "<cert name>"` instead, which stays stable across
-# rebuilds.
-codesign --force --deep --sign - "$APP_DIR"
+# A stable self-signed code-signing identity, generated once and reused for
+# every install/reinstall from then on. This is the actual fix for a real
+# gotcha found live (2026-09-22): plain ad-hoc signing (`codesign --sign -`)
+# derives its "identity" from the binary's own hash, which changes on every
+# rebuild — macOS's Accessibility grant is tied to that identity, so each
+# rebuild silently broke CGEventPost (no error) until the grant was fully
+# removed and re-added. A real certificate-backed signature keeps the same
+# identity across rebuilds (same private key/cert, different binary
+# content), so TCC recognizes it as "the same app" every time instead.
+if ! security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
+    echo "==> No local code-signing certificate found — generating one (one-time, local-only, never leaves this Mac)..."
+    CERT_TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "$CERT_TMPDIR"' EXIT
+    openssl req -x509 -newkey rsa:2048 -keyout "$CERT_TMPDIR/key.pem" -out "$CERT_TMPDIR/cert.pem" \
+        -days 3650 -nodes -subj "/CN=$CERT_NAME" \
+        -addext "extendedKeyUsage=codeSigning" \
+        -addext "basicConstraints=critical,CA:false" \
+        -addext "keyUsage=critical,digitalSignature"
+    openssl pkcs12 -export -out "$CERT_TMPDIR/cert.p12" -inkey "$CERT_TMPDIR/key.pem" \
+        -in "$CERT_TMPDIR/cert.pem" -passout pass:temp
+    security import "$CERT_TMPDIR/cert.p12" -k ~/Library/Keychains/login.keychain-db \
+        -P temp -T /usr/bin/codesign -A
+    echo "==> Certificate '$CERT_NAME' generated and imported into your login keychain."
+fi
+
+echo "==> Code signing with the stable '$CERT_NAME' identity..."
+codesign --force --deep --sign "$CERT_NAME" "$APP_DIR"
 
 mkdir -p "$LOG_DIR"
 EXECUTABLE_PATH="$APP_DIR/Contents/MacOS/mwb_mac_bridge"
@@ -54,15 +73,25 @@ Installed to: $APP_DIR
 LaunchAgent:  $PLIST_PATH
 Logs:         $LOG_DIR/
 
-IMPORTANT — every install/reinstall needs a manual permission step:
-Open System Settings > Privacy & Security > Accessibility. CGEventPost
-silently does nothing without this grant — no error, no crash, input just
-won't forward.
-  - First install: add "$APP_NAME" (+ button, browse to $APP_DIR).
-  - Reinstall (after this script rebuilds a new binary): ad-hoc signing
-    means the signature changed, and confirmed live, just toggling the
-    existing entry off/on does NOT restore trust — remove it entirely
-    (− button) and re-add it (+ button) instead.
+IMPORTANT — first install needs a manual permission grant (can't be
+scripted — it's a macOS security gate): open System Settings > Privacy &
+Security > Accessibility, and add "$APP_NAME" (+ button, browse to
+$APP_DIR if it's not listed). CGEventPost silently does nothing without
+this — no error, no crash, input just won't forward.
+
+Thanks to the stable signing identity above, this grant now persists
+across future reinstalls/rebuilds — no more remove-and-re-add dance
+(confirmed live, 2026-09-22: rebuilt with a real source change, and
+Accessibility kept working with zero manual steps). Two one-time-only
+exceptions, both already behind you after your very first install with
+this identity:
+  - Switching an existing ad-hoc-signed install over to this identity
+    needs one manual re-grant (old and new identities are different).
+  - The very first time codesign uses the newly-generated certificate's
+    private key, macOS may show a one-time keychain password prompt to
+    approve access — click Always Allow / enter your password once, and
+    it won't ask again for this identity.
+
 Then restart the app:
   launchctl kickstart -k gui/\$(id -u)/$BUNDLE_ID
 EOF

@@ -9,6 +9,8 @@
 // first, same category of "convincing false positive" the MWB Windows-side
 // toasts turned out to be on the Linux build.
 
+use std::time::{Duration, Instant};
+
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
@@ -27,6 +29,16 @@ use crate::keycode_macos::evdev_to_cgkeycode;
 const CG_BUTTON_CENTER: i64 = 2;
 const CG_BUTTON_SIDE: i64 = 3;
 const CG_BUTTON_EXTRA: i64 = 4;
+
+// Apple's own default double-click interval is user-configurable (System
+// Settings > Trackpad/Mouse), but there's no simple way to read that
+// preference from here — this fixed value matches Apple's own default.
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+// A second click further than this from the first doesn't count as the
+// same click for click-count purposes — keeps a click, a small hand-jitter
+// move, then a second click nearby still registering as a double-click,
+// while a click somewhere else entirely doesn't.
+const DOUBLE_CLICK_DISTANCE: f64 = 5.0;
 
 // Picked for a comfortable, trackpad-like feel at the shared protocol's
 // default scroll_speed=1.0 (one Windows wheel click -> ~45px here); tune
@@ -71,6 +83,20 @@ pub struct CgInput {
     // works too, but keeping our own last-posted position avoids an extra
     // syscall per event and matches what we just told the OS to do anyway.
     pos: CGPoint,
+    // Which button is currently held, if any — determines whether a move
+    // posts as MouseMoved or a *Dragged variant (see `move_absolute`'s doc
+    // comment for why this matters: window/text-selection drag tracking
+    // specifically listens for the Dragged event types, not MouseMoved with
+    // a button field set).
+    held_button: Option<(CGEventType, Option<i64>)>,
+    // Double/triple-click tracking (see `button`'s doc comment) — macOS
+    // apps use the click-count field to distinguish a single click from a
+    // double-click (e.g. title-bar zoom), which CGEventCreateMouseEvent
+    // doesn't infer on its own the way a real hardware click stream does.
+    last_click_button: Option<u32>,
+    last_click_time: Instant,
+    last_click_pos: CGPoint,
+    click_count: i64,
 }
 
 impl CgInput {
@@ -79,10 +105,19 @@ impl CgInput {
             .expect("failed to create CGEventSource — is this process sandboxed?");
         let bounds = virtual_desktop_bounds();
         let pos = CGPoint::new(bounds.origin.x + bounds.size.width / 2.0, bounds.origin.y + bounds.size.height / 2.0);
-        Self { source, flags: CGEventFlags::CGEventFlagNull, pos }
+        Self {
+            source,
+            flags: CGEventFlags::CGEventFlagNull,
+            pos,
+            held_button: None,
+            last_click_button: None,
+            last_click_time: Instant::now(),
+            last_click_pos: pos,
+            click_count: 1,
+        }
     }
 
-    fn post_mouse(&self, event_type: CGEventType, button_field: Option<i64>) {
+    fn post_mouse(&self, event_type: CGEventType, button_field: Option<i64>, click_count: Option<i64>) {
         let Ok(event) = CGEvent::new_mouse_event(self.source.clone(), event_type, self.pos, CGMouseButton::Left) else {
             eprintln!("(cg_input: failed to create mouse event)");
             return;
@@ -90,6 +125,9 @@ impl CgInput {
         event.set_flags(self.flags);
         if let Some(n) = button_field {
             event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, n);
+        }
+        if let Some(n) = click_count {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, n);
         }
         event.post(CGEventTapLocation::HID);
     }
@@ -107,31 +145,78 @@ impl InputSink for CgInput {
     /// *receiving* machine's own full screen, same convention Windows'
     /// SendInput(MOUSEEVENTF_ABSOLUTE) uses. Mapped onto the bounding
     /// rectangle across every active display — see `virtual_desktop_bounds`.
+    ///
+    /// Posts a `*MouseDragged` event instead of plain `MouseMoved` whenever
+    /// a button is currently held (`held_button`, set by `button` below) —
+    /// confirmed live, 2026-09-22, this is required, not cosmetic: window
+    /// dragging and title-bar double-click-to-zoom both rely on the
+    /// WindowServer's live drag-tracking, which specifically watches for
+    /// the Dragged event *types*, not just a MouseMoved event with a button
+    /// field set. Posting plain MouseMoved while a button was held meant a
+    /// dragged window never visually followed the cursor, only snapping to
+    /// its final position on mouse-up.
     fn move_absolute(&mut self, x: u32, y: u32, x_extent: u32, y_extent: u32) {
         let bounds = virtual_desktop_bounds();
         let fx = x as f64 / x_extent as f64;
         let fy = y as f64 / y_extent as f64;
         self.pos = CGPoint::new(bounds.origin.x + fx * bounds.size.width, bounds.origin.y + fy * bounds.size.height);
-        self.post_mouse(CGEventType::MouseMoved, None);
+        let (event_type, button_field) = match self.held_button {
+            Some((CGEventType::LeftMouseDown, _)) => (CGEventType::LeftMouseDragged, None),
+            Some((CGEventType::RightMouseDown, _)) => (CGEventType::RightMouseDragged, None),
+            Some((CGEventType::OtherMouseDown, field)) => (CGEventType::OtherMouseDragged, field),
+            _ => (CGEventType::MouseMoved, None),
+        };
+        self.post_mouse(event_type, button_field, None);
     }
 
+    /// Posts button down/up, tracking two bits of state real hardware click
+    /// streams carry implicitly but `CGEventCreateMouseEvent` doesn't infer
+    /// on its own:
+    /// - **Held-button state** (`held_button`), consumed by `move_absolute`
+    ///   above to post drag events instead of plain moves.
+    /// - **Click count** (`EventField::MOUSE_EVENT_CLICK_STATE`): a second
+    ///   press of the same button, close in time and position to the first
+    ///   (Apple's own double-click interval/distance conventions), needs
+    ///   `click_count=2` for apps/the WindowServer to recognize it as a
+    ///   double-click (e.g. title-bar zoom) rather than two independent
+    ///   single clicks — confirmed live, 2026-09-22, double-click-to-zoom
+    ///   silently did nothing without this, no error, matching the general
+    ///   "looks fine, does nothing" failure mode this whole module has
+    ///   already hit a few times. The same count applies to both the down
+    ///   and its matching up event, mirroring real click semantics.
     fn button(&mut self, button_code: u32, pressed: bool) {
         use mwb_protocol::input_handling::{BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
-        let (event_type, button_field) = match button_code {
-            BTN_LEFT => (if pressed { CGEventType::LeftMouseDown } else { CGEventType::LeftMouseUp }, None),
-            BTN_RIGHT => (if pressed { CGEventType::RightMouseDown } else { CGEventType::RightMouseUp }, None),
-            BTN_MIDDLE => {
-                (if pressed { CGEventType::OtherMouseDown } else { CGEventType::OtherMouseUp }, Some(CG_BUTTON_CENTER))
-            }
-            BTN_SIDE => {
-                (if pressed { CGEventType::OtherMouseDown } else { CGEventType::OtherMouseUp }, Some(CG_BUTTON_SIDE))
-            }
-            BTN_EXTRA => {
-                (if pressed { CGEventType::OtherMouseDown } else { CGEventType::OtherMouseUp }, Some(CG_BUTTON_EXTRA))
-            }
+        let (down_type, up_type, button_field) = match button_code {
+            BTN_LEFT => (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp, None),
+            BTN_RIGHT => (CGEventType::RightMouseDown, CGEventType::RightMouseUp, None),
+            BTN_MIDDLE => (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp, Some(CG_BUTTON_CENTER)),
+            BTN_SIDE => (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp, Some(CG_BUTTON_SIDE)),
+            BTN_EXTRA => (CGEventType::OtherMouseDown, CGEventType::OtherMouseUp, Some(CG_BUTTON_EXTRA)),
             _ => return,
         };
-        self.post_mouse(event_type, button_field);
+
+        if pressed {
+            let now = Instant::now();
+            let dx = self.pos.x - self.last_click_pos.x;
+            let dy = self.pos.y - self.last_click_pos.y;
+            let same_spot = (dx * dx + dy * dy).sqrt() <= DOUBLE_CLICK_DISTANCE;
+            self.click_count = if self.last_click_button == Some(button_code)
+                && now.duration_since(self.last_click_time) <= DOUBLE_CLICK_INTERVAL
+                && same_spot
+            {
+                self.click_count + 1
+            } else {
+                1
+            };
+            self.last_click_button = Some(button_code);
+            self.last_click_time = now;
+            self.last_click_pos = self.pos;
+            self.held_button = Some((down_type, button_field));
+            self.post_mouse(down_type, button_field, Some(self.click_count));
+        } else {
+            self.held_button = None;
+            self.post_mouse(up_type, button_field, Some(self.click_count));
+        }
     }
 
     /// `value` arrives in `handle_mouse`'s shared ~15-units-per-Windows-click

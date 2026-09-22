@@ -76,12 +76,12 @@ bugs** below for current rough edges.
 
 ## macOS
 
-**Status: mouse + keyboard forwarding and clipboard text sync (both
-directions) working end-to-end, packaged as a proper autostarting `.app`,
-all live-tested against a real Windows PC.** Not yet ported: clipboard
-images, file transfer, lock-both-machines, suspend/resume handling.
-Horizontal scroll's sign isn't independently confirmed yet (only vertical
-was live-tested).
+**Status: mouse + keyboard forwarding (including window dragging and
+double-click-to-zoom) and clipboard text sync (both directions) working
+end-to-end, packaged as a proper autostarting `.app`, all live-tested
+against a real Windows PC.** Not yet ported: clipboard images, file
+transfer, lock-both-machines, suspend/resume handling. Horizontal scroll's
+sign isn't independently confirmed yet (only vertical was live-tested).
 
 Menu bar icon is a simple procedurally-drawn double-headed arrow
 (`macos/src/tray.rs`'s `bridge_icon`), rendered as a template image so it
@@ -106,7 +106,23 @@ change, Accessibility kept working with zero manual steps. Two one-time
 exceptions (both already behind you after the first install with this
 identity): switching an existing ad-hoc install over needs one manual
 re-grant, and the very first time `codesign` uses the new certificate's
-private key, macOS may show a one-time keychain password prompt.
+private key, macOS may show a one-time keychain password prompt — if it
+keeps prompting on every rebuild rather than just once, also run (once,
+needs your login password, deliberately not scripted):
+```sh
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~/Library/Keychains/login.keychain-db
+```
+
+**Fixed: window dragging and double-click-to-zoom.** `cg_input.rs` always
+posted plain `MouseMoved` while a button was held (instead of the
+`*MouseDragged` event types macOS's live window-drag-tracking specifically
+watches for — a dragged window only snapped to its final position on
+mouse-up rather than following the cursor), and never set
+`EventField::MOUSE_EVENT_CLICK_STATE` (so no synthesized click was ever
+recognized as a double-click, e.g. title-bar zoom silently did nothing).
+Both fixed — `move_absolute` now tracks which button is held and posts the
+matching Dragged type, and `button` tracks click timing/position to set a
+real click count on both the down and up events.
 
 Requires **Accessibility permission** (System Settings > Privacy &
 Security > Accessibility) granted to the running binary — `CGEventPost`

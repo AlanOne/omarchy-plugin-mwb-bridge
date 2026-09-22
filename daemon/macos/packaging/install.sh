@@ -54,6 +54,18 @@ if ! security find-certificate -c "$CERT_NAME" >/dev/null 2>&1; then
     security import "$CERT_TMPDIR/cert.p12" -k ~/Library/Keychains/login.keychain-db \
         -P temp -T /usr/bin/codesign -A
     echo "==> Certificate '$CERT_NAME' generated and imported into your login keychain."
+
+    # The `-T` grant above is not sufficient on its own on modern macOS —
+    # confirmed live, 2026-09-22: codesign still prompted for the login
+    # keychain password on first use despite it. The actual fix is also
+    # granting access via the newer partition-list ACL mechanism, which
+    # needs the keychain (login) password once — prompted interactively
+    # here rather than passed as a script argument, so it's typed directly
+    # into the terminal rather than passing through anything else. This is
+    # a one-time step: once set, it applies to every future codesign call
+    # using this identity, on every future rebuild.
+    echo "==> One more one-time step: macOS needs your login password to let codesign use this certificate without prompting on every future build."
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s ~/Library/Keychains/login.keychain-db
 fi
 
 echo "==> Code signing with the stable '$CERT_NAME' identity..."

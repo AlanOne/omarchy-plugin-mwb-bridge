@@ -83,8 +83,14 @@ images, file transfer, lock-both-machines, suspend/resume handling.
 Horizontal scroll's sign isn't independently confirmed yet (only vertical
 was live-tested).
 
-**TODO: menu bar icon.** Currently a plain white square placeholder
-(`macos/src/tray.rs`'s `placeholder_icon`) — needs a real designed icon.
+Menu bar icon is a simple procedurally-drawn double-headed arrow
+(`macos/src/tray.rs`'s `bridge_icon`), rendered as a template image so it
+adapts to light/dark menu bar appearance — not a real designed asset, but
+no longer the plain placeholder square either. The app is menu-bar-only
+(no Dock icon/app-switcher entry) via `Info.plist`'s `LSUIElement=true`
+**plus** `tao`'s `EventLoopExtMacOS::set_activation_policy(Accessory)` —
+confirmed live that `LSUIElement` alone isn't enough, since tao's own
+`NSApplication` setup defaults to the Regular policy regardless.
 
 **Gotcha: every rebuild needs the Accessibility grant fully redone, not
 just toggled.** Ad-hoc code signing (see `install.sh`'s comment) means each

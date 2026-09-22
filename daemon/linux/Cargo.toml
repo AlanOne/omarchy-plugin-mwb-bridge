@@ -1,0 +1,15 @@
+[package]
+name = "mwb_omarchy_bridge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mwb_protocol = { path = "../protocol" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+memfd = "0.6.6"
+rand = "0.10.2"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+xkbcommon = "0.9.0"

@@ -20,8 +20,8 @@ bugs** below for current rough edges.
 
 ## Known bugs
 
-- **Keyboard layout issues.** VK→evdev translation (`daemon/src/
-  vk_keycode.rs`) has only been verified against a Slovenian (QWERTZ)
+- **Keyboard layout issues.** VK→evdev translation (`daemon/protocol/src/
+  vk_keycode.rs`, shared by both the Linux and macOS builds) has only been verified against a Slovenian (QWERTZ)
   layout, where it now covers letters, digits, common punctuation, the
   numpad, and AltGr/Level-3 characters (e.g. `<`/`>`). Other layouts are
   likely to hit wrong characters somewhere, especially punctuation/OEM
@@ -46,28 +46,69 @@ bugs** below for current rough edges.
 
 ## How it's put together
 
-This repo is two things in one:
+`daemon/` is a Cargo workspace with three crates:
 
-- **The daemon** (`daemon/`) — a Rust program that reimplements Mouse
-  Without Borders' wire protocol and talks straight to Hyprland's own
+- **`daemon/protocol/`** — the entire MWB wire protocol (crypto, framing,
+  handshake, clipboard chunking, file-transfer framing) plus the shared
+  Mouse/Keyboard *decoding* logic (`input_handling.rs`: WM_* flag handling,
+  VK→evdev translation via `vk_keycode.rs`, repeat-key dedup, the
+  lock-combo detector, scroll-unit conversion) and the JSON config/status
+  format. Entirely OS-agnostic — used unchanged by both platform builds
+  below, which only differ in how they actually inject input. See
+  `daemon/PROTOCOL.md` for everything reverse-engineered about the wire
+  protocol, and several Windows-side PowerToys state bugs (matrix/pool
+  registration, handshake checksums, package-ID dedup) that turned out to
+  matter far more than the protocol itself — these apply identically
+  regardless of which platform build you're pairing.
+- **`daemon/linux/`** — the Omarchy build: talks straight to Hyprland's own
   exposed wlroots protocols (`zwlr_virtual_pointer_v1` for the mouse,
   `zwp_virtual_keyboard_v1` for the keyboard) to actually move the cursor
-  and type. Runs as a systemd `--user` service. See `daemon/PROTOCOL.md`
-  for everything reverse-engineered about the wire protocol, and several
-  Windows-side PowerToys state bugs that turned out to matter far more
-  than the protocol itself.
-- **The plugin** (`manifest.json`, `BarWidget.qml`, at the repo root — the
-  standard Omarchy plugin layout) — a thin QML front-end giving the daemon
-  a status icon plus a popup for start/stop/restart and settings (shared
-  security key, Windows PC address, this machine's name). It doesn't
-  implement any of the actual input-forwarding logic itself, and it builds
-  and installs the daemon for you the first time it loads (see below) —
-  there's nothing to build or install by hand.
+  and type. Runs as a systemd `--user` service, supervised by the plugin
+  below (`manifest.json`, `BarWidget.qml` at the repo root — the standard
+  Omarchy plugin layout — a thin QML front-end for status/settings; it
+  builds and installs the daemon for you the first time it loads, nothing
+  to build or install by hand). They're split this way because plugins run
+  unsandboxed inside the long-running Omarchy shell process — real
+  protocol/crypto/Wayland-protocol code doesn't belong in there.
+- **`daemon/macos/`** — the macOS build (see **macOS** below for status):
+  injects input via Core Graphics `CGEventPost` instead, and is its own
+  small menu-bar app rather than a plugin hosted by anything else.
 
-They're split this way because plugins run unsandboxed inside the
-long-running Omarchy shell process — real protocol/crypto/Wayland-protocol
-code doesn't belong in there, so it's a separate daemon the plugin only
-supervises over `systemctl` and a couple of JSON files.
+## macOS
+
+**Status: milestone 1 (mouse + keyboard forwarding) working end-to-end,
+live-tested against a real Windows PC.** Not yet ported: clipboard sync,
+lock-both-machines, file transfer, suspend/resume handling, autostart, and
+real `.app` packaging (currently a plain `cargo build`/manual-launch debug
+binary, no code signing). Horizontal scroll's sign isn't independently
+confirmed yet (only vertical was live-tested).
+
+Requires **Accessibility permission** (System Settings > Privacy &
+Security > Accessibility) granted to the running binary — `CGEventPost`
+silently does nothing without it, no error. Config lives at
+`~/Library/Application Support/mwb-mac-bridge/config.json` (same fields as
+the Linux build's `config.json`: `security_key`, `windows_ip`,
+`machine_name`, `machine_id`, `scroll_speed`; `xkb_layout`/`xkb_variant`
+are ignored here — the Mac's own selected input source handles character
+mapping instead, same division of responsibility XKB has on Linux). A
+template is written on first run if none exists; edit it via the menu bar
+icon's "Edit Config..." item, then "Restart App".
+
+**Also requires the Windows PC to actually know about this machine** —
+PowerToys' Settings UI has a known bug (see `daemon/PROTOCOL.md`) where
+adding a new machine via the UI doesn't reliably persist to
+`MachineMatrixString`/`MachinePool`/`Name2IP` in
+`%LOCALAPPDATA%\Microsoft\PowerToys\MouseWithoutBorders\settings.json` —
+if the handshake succeeds but Windows never sends anything further
+afterward (not even periodic Hi pings), this is almost certainly why; quit
+PowerToys fully, hand-edit those three fields to match the existing
+entries' format, relaunch.
+
+Build and run from `daemon/`:
+
+```sh
+cargo run -p mwb_mac_bridge
+```
 
 ## Clipboard
 

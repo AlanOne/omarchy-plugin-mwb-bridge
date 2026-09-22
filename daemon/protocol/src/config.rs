@@ -1,9 +1,11 @@
-// Runtime config + live status, both read/written as JSON files under
-// ~/.local/share/omarchy-mwb-bridge/ so the Omarchy plugin's bar widget can
-// configure this daemon and show its connection status without either side
+// Runtime config + live status, both read/written as JSON files under a
+// per-OS data dir (Linux: ~/.local/share/omarchy-mwb-bridge/, macOS:
+// ~/Library/Application Support/mwb-mac-bridge/) so each platform's
+// front-end (the Omarchy bar widget on Linux, the menu bar app on macOS) can
+// configure the daemon and show its connection status without either side
 // needing to know about the other's internals. The daemon only reads
-// config.json at startup (no live-reload) — the widget restarts the service
-// after saving a change, matching how Cameras' go2rtc container is
+// config.json at startup (no live-reload) — the front-end restarts the
+// daemon after saving a change, matching how Cameras' go2rtc container is
 // restarted after config edits rather than hot-reloaded.
 
 use serde::{Deserialize, Serialize};
@@ -43,20 +45,27 @@ fn default_scroll_speed() -> f64 {
     1.0
 }
 
-#[derive(Serialize)]
-struct Status {
-    connected: bool,
-    peer: String,
-    detail: String,
-    updated_epoch: u64,
+#[derive(Serialize, Deserialize)]
+pub struct Status {
+    pub connected: bool,
+    pub peer: String,
+    pub detail: String,
+    pub updated_epoch: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn data_dir() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME not set");
     PathBuf::from(home).join(".local/share/omarchy-mwb-bridge")
 }
 
-fn config_path() -> PathBuf {
+#[cfg(target_os = "macos")]
+fn data_dir() -> PathBuf {
+    let home = std::env::var("HOME").expect("HOME not set");
+    PathBuf::from(home).join("Library/Application Support/mwb-mac-bridge")
+}
+
+pub fn config_path() -> PathBuf {
     data_dir().join("config.json")
 }
 
@@ -69,6 +78,16 @@ fn status_path() -> PathBuf {
 /// this as "not configured yet" and retry, not as a fatal error.
 pub fn load_config() -> Option<Config> {
     let text = std::fs::read_to_string(config_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Reads back whatever `write_status` last wrote — `None` if the daemon
+/// hasn't written a status yet (not yet configured, or this is the very
+/// first tick after starting). Best-effort in the same spirit as
+/// `write_status`: a missing/malformed file just means "nothing to show
+/// yet," not an error worth surfacing to the front-end.
+pub fn read_status() -> Option<Status> {
+    let text = std::fs::read_to_string(status_path()).ok()?;
     serde_json::from_str(&text).ok()
 }
 

@@ -20,6 +20,25 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
+use mwb_protocol::input_handling::{InputSink, ModifierState};
+
+// Standard XKB "us" layout modifier bit indices (Shift/Ctrl/Alt/Super) —
+// matches xkbcommon's default assignment for this layout. Not derived from
+// the actual compiled keymap yet; verify against it if modifier behavior
+// ever looks wrong for a different layout.
+const MOD_SHIFT: u32 = 1 << 0;
+const MOD_CTRL: u32 = 1 << 2;
+const MOD_ALT: u32 = 1 << 3;
+const MOD_SUPER: u32 = 1 << 6;
+// Mod5 / "Level3Shift" — what layouts using xkeyboard-config's
+// `level3(ralt_switch)` (which ours does, via Right Alt) bind AltGr to. This
+// is a distinct real modifier from Alt/Mod1: layouts with AltGr-level
+// characters (e.g. this Slovenian layout's `<`/`>` on the comma/period keys)
+// only resolve to level 3 when this bit is set, not MOD_ALT.
+const MOD_LEVEL3: u32 = 1 << 7;
+// Mod2 — XKB's conventional NumLock lock-modifier.
+const LOCK_NUMLOCK: u32 = 1 << 4;
+
 struct AppState {
     seat: Option<wl_seat::WlSeat>,
     pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
@@ -244,11 +263,58 @@ impl WaylandInput {
     }
 
     /// Sets the full modifier mask directly (depressed/latched/locked groups
-    /// per the virtual-keyboard protocol's modifiers() request). Callers
-    /// track their own modifier state and call this before key() when it
-    /// changes, mirroring how a real compositor tracks Shift/Ctrl/Alt/Super.
-    pub fn modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
+    /// per the virtual-keyboard protocol's modifiers() request) — the raw
+    /// XKB-flavored call `InputSink::modifiers` translates into.
+    fn raw_modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
         self.keyboard.modifiers(depressed, latched, locked, group);
         self.flush();
+    }
+}
+
+impl InputSink for WaylandInput {
+    fn move_absolute(&mut self, x: u32, y: u32, x_extent: u32, y_extent: u32) {
+        WaylandInput::move_absolute(self, x, y, x_extent, y_extent)
+    }
+
+    fn button(&mut self, button_code: u32, pressed: bool) {
+        WaylandInput::button(self, button_code, pressed)
+    }
+
+    fn scroll_vertical(&mut self, value: f64) {
+        WaylandInput::scroll_vertical(self, value)
+    }
+
+    fn scroll_horizontal(&mut self, value: f64) {
+        WaylandInput::scroll_horizontal(self, value)
+    }
+
+    fn key(&mut self, evdev_code: u32, pressed: bool) {
+        WaylandInput::key(self, evdev_code, pressed)
+    }
+
+    /// Converts the generic `ModifierState` into the XKB depressed-modifier
+    /// bitmask this compositor's compiled keymap expects, forcing NumLock
+    /// locked (rather than tracking/toggling it) on numpad keys — see
+    /// `handle_keyboard`'s doc comment in `mwb_protocol::input_handling` for
+    /// why that avoids a real desync bug found live on this exact layout.
+    fn modifiers(&mut self, state: ModifierState, numlock: bool) {
+        let mut depressed = 0;
+        if state.shift {
+            depressed |= MOD_SHIFT;
+        }
+        if state.ctrl {
+            depressed |= MOD_CTRL;
+        }
+        if state.alt {
+            depressed |= MOD_ALT;
+        }
+        if state.super_ {
+            depressed |= MOD_SUPER;
+        }
+        if state.level3 {
+            depressed |= MOD_LEVEL3;
+        }
+        let locked = if numlock { LOCK_NUMLOCK } else { 0 };
+        self.raw_modifiers(depressed, 0, locked, 0);
     }
 }

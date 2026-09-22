@@ -3,20 +3,19 @@
 // feeds decoded Mouse/Keyboard packets into the Wayland injector. See
 // PROTOCOL.md for the wire protocol this implements.
 
-use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use flate2::read::DeflateDecoder;
-use mwb_omarchy_bridge::config::{self, Config};
-use mwb_omarchy_bridge::mwb_protocol::*;
-use mwb_omarchy_bridge::vk_keycode::vk_to_evdev;
 use mwb_omarchy_bridge::wayland_input::WaylandInput;
+use mwb_protocol::config::{self, Config};
+use mwb_protocol::mwb_protocol::*;
+use mwb_protocol::vk_keycode::vk_to_evdev;
 use rand::RngExt;
 
 // Same message-server port MWB uses on every machine (BASE_PORT + 1). We
@@ -61,251 +60,12 @@ fn set_socket_timeouts(stream: &TcpStream) {
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
 }
 
-// Standard XKB "us" layout modifier bit indices (Shift/Ctrl/Alt/Super) —
-// matches xkbcommon's default assignment for this layout. Not derived from
-// the actual compiled keymap yet; verify against it if modifier behavior
-// ever looks wrong for a different layout.
-const MOD_SHIFT: u32 = 1 << 0;
-const MOD_CTRL: u32 = 1 << 2;
-const MOD_ALT: u32 = 1 << 3;
-const MOD_SUPER: u32 = 1 << 6;
-// Mod5 / "Level3Shift" — what layouts using xkeyboard-config's
-// `level3(ralt_switch)` (which ours does, via Right Alt) bind AltGr to. This
-// is a distinct real modifier from Alt/Mod1: layouts with AltGr-level
-// characters (e.g. this Slovenian layout's `<`/`>` on the comma/period keys)
-// only resolve to level 3 when this bit is set, not MOD_ALT.
-const MOD_LEVEL3: u32 = 1 << 7;
-// Mod2 — XKB's conventional NumLock lock-modifier.
-const LOCK_NUMLOCK: u32 = 1 << 4;
-const VK_NUMLOCK: u32 = 0x90;
-
-// Win32 WM_* message constants carried in Mouse/Keyboard dwFlags fields.
-const WM_MOUSEMOVE: u32 = 0x0200;
-const WM_LBUTTONDOWN: u32 = 0x0201;
-const WM_LBUTTONUP: u32 = 0x0202;
-const WM_RBUTTONDOWN: u32 = 0x0204;
-const WM_RBUTTONUP: u32 = 0x0205;
-const WM_MBUTTONDOWN: u32 = 0x0207;
-const WM_MBUTTONUP: u32 = 0x0208;
-const WM_MOUSEWHEEL: u32 = 0x020A;
-const WM_XBUTTONDOWN: u32 = 0x020B;
-const WM_XBUTTONUP: u32 = 0x020C;
-const WM_MOUSEHWHEEL: u32 = 0x020E;
-const BTN_LEFT: u32 = 0x110;
-const BTN_RIGHT: u32 = 0x111;
-const BTN_MIDDLE: u32 = 0x112;
-// Standard Linux evdev "side"/"extra" buttons — the conventional back/
-// forward mapping used by browsers and file managers alike.
-const BTN_SIDE: u32 = 0x113;
-const BTN_EXTRA: u32 = 0x114;
-// LLKHF_UP: bit 7 of a low-level-keyboard-hook's flags marks a key-up event.
-const LLKHF_UP: u32 = 0x80;
-
-const VK_L: u32 = 0x4C;
-
-// Real MWB's own HotKeyLockMachine feature (a double-tap of the configured
-// combo — Win+L here, confirmed with Alan, an unmodified default) sends the
-// combo's own keys as an ordinary Keyboard-packet burst before locking
-// itself: all keys down back-to-back, then all up back-to-back, no new
-// package type — see PROTOCOL.md. No natural keypress produces this
-// pattern (a human pressing even a 2-key chord has real, non-zero timing
-// between each key), so a tight time window reliably distinguishes it.
-const LOCK_COMBO_WINDOW: Duration = Duration::from_millis(150);
-
-/// Recognizes that burst arriving as regular Keyboard packets: a small
-/// ring buffer of recent (vk, pressed) events with timestamps, firing once
-/// LWIN-down, L-down, LWIN-up, and L-up are all present within
-/// `LOCK_COMBO_WINDOW` of each other (order doesn't matter beyond that —
-/// real MWB sends down-then-up, but matching by presence-in-window is
-/// simpler and just as reliable given no natural keypress could produce
-/// this set that fast either way).
-struct LockComboDetector {
-    recent: VecDeque<(u32, bool, Instant)>,
-}
-
-impl LockComboDetector {
-    fn new() -> Self {
-        Self { recent: VecDeque::with_capacity(8) }
-    }
-
-    /// Returns true (once) when the combo is detected — clears its buffer
-    /// afterward so the same burst can't re-fire on a later call.
-    fn observe(&mut self, vk: u32, pressed: bool) -> bool {
-        let now = Instant::now();
-        self.recent.push_back((vk, pressed, now));
-        while self.recent.len() > 8 {
-            self.recent.pop_front();
-        }
-        while self.recent.front().is_some_and(|&(_, _, t)| now.duration_since(t) > LOCK_COMBO_WINDOW) {
-            self.recent.pop_front();
-        }
-
-        let is_win = |v: u32| v == 0x5B || v == 0x5C;
-        let has = |target_win: bool, want_pressed: bool| {
-            self.recent.iter().any(|&(v, p, _)| p == want_pressed && (if target_win { is_win(v) } else { v == VK_L }))
-        };
-        let fired = has(true, true) && has(false, true) && has(true, false) && has(false, false);
-        if fired {
-            self.recent.clear();
-        }
-        fired
-    }
-}
-
-struct ModState {
-    depressed: u32,
-}
-
-impl ModState {
-    fn new() -> Self {
-        Self { depressed: 0 }
-    }
-
-    /// Updates tracked modifier state for this VK if it's a modifier key,
-    /// returns true if it was one (caller still forwards the raw keypress
-    /// either way — modifiers are real keys too).
-    fn update(&mut self, vk: u32, pressed: bool) -> bool {
-        let bit = match vk {
-            0x10 | 0xA0 | 0xA1 => MOD_SHIFT,
-            0x11 | 0xA2 | 0xA3 => MOD_CTRL,
-            0x12 | 0xA4 => MOD_ALT,
-            // VK_RMENU: Windows reports AltGr as a synthetic VK_LCONTROL
-            // down/up pair immediately around the real VK_RMENU (verified
-            // empirically — every AltGr press logs 0xA2 then 0xA5, in that
-            // order, on both press and release). Forwarding that fake Ctrl
-            // as MOD_CTRL and this key as MOD_ALT never reaches level 3 —
-            // clear the fake Ctrl bit and use MOD_LEVEL3 instead, matching
-            // what `level3(ralt_switch)` actually binds Right Alt to.
-            0xA5 => {
-                self.depressed &= !MOD_CTRL;
-                MOD_LEVEL3
-            }
-            0x5B | 0x5C => MOD_SUPER,
-            _ => return false,
-        };
-        if pressed {
-            self.depressed |= bit;
-        } else {
-            self.depressed &= !bit;
-        }
-        true
-    }
-}
-
-// Windows reports one wheel "click" as WHEEL_DELTA = 120 (WM_MOUSEWHEEL's
-// HIWORD), but the wlr-virtual-pointer protocol's `axis` value is documented
-// as "length of vector in touchpad coordinates" — a completely different
-// unit, closer to the handful-of-pixels a real wheel's libinput driver
-// reports per click (empirically, around 15). Forwarding Windows' raw 120
-// straight through (this daemon's original behavior) overscrolls by roughly
-// 8x — confirmed by Alan actually feeling it ("a single scroll moves the
-// page too much"). This baseline converts one Windows click into one
-// conventional ~15-unit click; `scroll_speed` (config.json, user-tunable
-// through the plugin's settings popup) multiplies on top of that for taste.
-const SCROLL_UNITS_PER_WHEEL_CLICK: f64 = 15.0 / 120.0;
-
-fn handle_mouse(wl: &mut WaylandInput, m1: u32, m2: u32, m3: u32, flags: u32, scroll_speed: f64) {
-    match flags {
-        WM_MOUSEMOVE => {
-            // Observed in real traffic (likely an edge-crossing overshoot):
-            // an occasional out-of-range value that's actually small and
-            // negative, wrapping to a huge u32 (e.g. 4294967271 = -25 as
-            // i32) when read as one. Clamp back into the valid 0..=65535
-            // absolute-coordinate range rather than forwarding it verbatim,
-            // which would otherwise send the cursor somewhere nonsensical.
-            let x = (m1 as i32).clamp(0, 65535) as u32;
-            let y = (m2 as i32).clamp(0, 65535) as u32;
-            wl.move_absolute(x, y, 65535, 65535)
-        }
-        WM_LBUTTONDOWN => wl.button(BTN_LEFT, true),
-        WM_LBUTTONUP => wl.button(BTN_LEFT, false),
-        WM_RBUTTONDOWN => wl.button(BTN_RIGHT, true),
-        WM_RBUTTONUP => wl.button(BTN_RIGHT, false),
-        WM_MBUTTONDOWN => wl.button(BTN_MIDDLE, true),
-        WM_MBUTTONUP => wl.button(BTN_MIDDLE, false),
-        WM_MOUSEWHEEL => {
-            // WheelDelta is a signed 16-bit value in Windows' usual +/-120
-            // per notch. Sign flipped (Windows: positive = away from user/
-            // up; Wayland vertical-scroll: positive = down) — matches
-            // physical scroll-wheel direction.
-            let delta = m3 as i32 as i16 as f64;
-            wl.scroll_vertical(-delta * SCROLL_UNITS_PER_WHEEL_CLICK * scroll_speed);
-        }
-        WM_MOUSEHWHEEL => {
-            // Same signed-16-bit-in-m3 shape as WM_MOUSEWHEEL (confirmed
-            // from real MWB's own InputHook.cs: WheelDelta is set from the
-            // same HIWORD(MouseData) read for every mouse message, not
-            // just WM_MOUSEWHEEL). Windows: positive = right; Wayland
-            // horizontal-scroll: positive = right too, no sign flip needed.
-            let delta = m3 as i32 as i16 as f64;
-            wl.scroll_horizontal(delta * SCROLL_UNITS_PER_WHEEL_CLICK * scroll_speed);
-        }
-        // Real MWB (per InputHook.cs, confirmed from source): every mouse
-        // message's WheelDelta slot (here, m3) is set from HIWORD(MouseData)
-        // regardless of message type — for WM_MOUSEWHEEL that's the scroll
-        // delta, but for WM_XBUTTONDOWN/UP it's *which* extra button
-        // (XBUTTON1=1, XBUTTON2=2), per the Win32 MSLLHOOKSTRUCT contract.
-        // These are standard side buttons (e.g. an MX Master's Back/
-        // Forward) that a real low-level mouse hook — and so real MWB —
-        // captures just fine; this daemon just never had a mapping for
-        // them until now.
-        WM_XBUTTONDOWN => wl.button(if m3 == 2 { BTN_EXTRA } else { BTN_SIDE }, true),
-        WM_XBUTTONUP => wl.button(if m3 == 2 { BTN_EXTRA } else { BTN_SIDE }, false),
-        _ => {}
-    }
-}
-
-fn handle_keyboard(
-    wl: &mut WaylandInput,
-    mods: &mut ModState,
-    pressed_keys: &mut HashSet<u32>,
-    vk: u32,
-    flags: u32,
-) {
-    // Windows' own NumLock state and this machine's are two independent,
-    // unsynchronized locks. Forwarding the raw NumLock keypress toggles our
-    // side's lock-state via the compositor's own keymap-driven handling —
-    // if the two ever disagree, numpad digit keys silently become
-    // navigation keys (Home/End/arrows/etc.) instead, since which one a
-    // numpad key produces depends entirely on the *receiving* side's
-    // NumLock state. Numpad keys below force NumLock-locked on every press
-    // instead, so this never needs tracking or toggling at all.
-    if vk == VK_NUMLOCK {
-        return;
-    }
-
-    let pressed = (flags & LLKHF_UP) == 0;
-    let is_mod = mods.update(vk, pressed);
-    let Some(evdev_code) = vk_to_evdev(vk) else {
-        eprintln!("(no evdev mapping for VK 0x{vk:02x}, ignoring)");
-        return;
-    };
-    if is_mod {
-        wl.modifiers(mods.depressed, 0, 0, 0);
-    } else if (0x60..=0x6F).contains(&vk) {
-        wl.modifiers(mods.depressed, 0, LOCK_NUMLOCK, 0);
-    }
-
-    // Windows forwards its own OS-level auto-repeat "down" messages for a
-    // held key -- a real, expected part of the wire protocol, not a bug on
-    // its end. Only forward the actual press/release *transition* to the
-    // compositor; a held key generating repeat characters is Hyprland's own
-    // repeat timer's job once it sees the first press, same as a real local
-    // keyboard (whose evdev driver never re-sends "pressed" for a key
-    // that's still down either). Forwarding every one of Windows' repeat
-    // packets as a fresh press compounded with Hyprland's own repeat,
-    // producing far more characters than intended for any key held even
-    // slightly too long. Releases always forward regardless of tracked
-    // state, so a missed/out-of-order press can never leave a key stuck.
-    if pressed {
-        if !pressed_keys.insert(evdev_code) {
-            return;
-        }
-    } else {
-        pressed_keys.remove(&evdev_code);
-    }
-    wl.key(evdev_code, pressed);
-}
+// Mouse/keyboard decoding (WM_* flag handling, VK translation, repeat-key
+// dedup, the lock-combo detector, scroll-unit conversion) lives in
+// `mwb_protocol::input_handling`, shared verbatim with the macOS daemon —
+// see that module's doc comment. `WaylandInput`'s `InputSink` impl (in
+// wayland_input.rs) is this platform's only actual divergence.
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, LLKHF_UP};
 
 /// Shared state between the client connection's receive loop, the file-
 /// server listener (port 15100), and the local clipboard-watcher thread —
@@ -790,20 +550,12 @@ fn run_session(
     let our_flipped: [u32; 4] = our_machine1_4.map(|v| !v);
     println!("[{role}] Handshake sent, entering receive loop.");
 
-    let mut mods = ModState::new();
-    // Windows forwards its own OS-level auto-repeat keydowns for a held key
-    // (confirmed empirically: 756 same-key "down" packets with no
-    // intervening "up" logged over one day of normal use, heavily on held
-    // navigation keys). handle_keyboard used to forward every one of those
-    // as a fresh wl_keyboard press, on top of whatever repeat Hyprland's own
-    // compositor-side repeat timer *also* generates once it sees the first
-    // press -- two independent repeat sources compounding, producing way
-    // more characters than intended for any key held even slightly too long
-    // (e.g. "channnnnnnnnnnnnnnnnnnge" for a normal fast keypress). Tracks
-    // which evdev keys are currently down so only the actual press/release
-    // transition gets forwarded, matching how a real local keyboard's evdev
-    // driver behaves (one press event; the compositor handles repetition).
-    let mut pressed_keys: HashSet<u32> = HashSet::new();
+    // Repeat-key dedup (Windows forwards its own OS-level auto-repeat
+    // keydowns for a held key; only the actual press/release transition
+    // should forward, or it compounds with Hyprland's own repeat timer —
+    // see `mwb_protocol::input_handling::handle_keyboard`'s doc comment)
+    // and modifier tracking both live in `KeyboardState` now.
+    let mut kb_state = KeyboardState::new();
     let mut lock_combo = LockComboDetector::new();
     let mut hi_count = 0u64;
     let mut clipboard_buf: Vec<u8> = Vec::new();
@@ -919,7 +671,7 @@ fn run_session(
                 }
                 if let Some(w) = wl.as_deref_mut() {
                     println!(">>> KEYBOARD vk=0x{vk:x} flags=0x{flags:x}");
-                    handle_keyboard(w, &mut mods, &mut pressed_keys, vk, flags);
+                    handle_keyboard(w, &mut kb_state, vk, flags);
                 }
             }
             PACKAGE_TYPE_CLIPBOARD_TEXT | PACKAGE_TYPE_CLIPBOARD_IMAGE => {

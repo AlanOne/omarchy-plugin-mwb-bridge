@@ -1,0 +1,259 @@
+// macOS port of the mwb-omarchy-bridge daemon — milestone 1: raw Mouse/
+// Keyboard forwarding + a minimal menu bar shell, nothing else yet.
+// Everything protocol-level (crypto, framing, handshake, VK->evdev
+// translation, mouse/keyboard decoding) is unchanged, shared code from
+// `mwb_protocol` — this file is only the platform wiring: the TCP
+// connect/reconnect loop and a status-item menu bar app. Clipboard sync,
+// lock-both-machines, file transfer, and suspend/resume handling are
+// deliberately not ported yet — see the mwb-omarchy-bridge project memory's
+// "macOS port" section for the full remaining list, being added
+// incrementally the same way the Linux build was.
+
+mod cg_input;
+mod keycode_macos;
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
+
+use mwb_protocol::config::{self, Config};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState};
+use mwb_protocol::mwb_protocol::*;
+use rand::RngExt;
+
+use cg_input::CgInput;
+
+// Same 5-minute idle-tolerant timeout the Linux build settled on after
+// finding both failure modes live (a no-timeout 3+ hour hang, then an
+// over-aggressive 30s timeout that false-triggered during normal idle
+// gaps) — see the mwb-omarchy-bridge project memory.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
+
+// Same message-server port MWB uses on every machine. Windows expects a
+// symmetric pair of sockets (one per direction) between two paired
+// machines — live-tested against the real Windows PC on 2026-09-22:
+// without accepting this reverse leg, the handshake completed and matched,
+// but Windows then sent *nothing* further at all afterward (not even
+// periodic Hi liveness pings), for a brand-new machine being paired for
+// the first time. The Linux build calls this leg "cosmetic only," but that
+// finding was on an already-established pairing — a first-time pairing
+// appears to need it. See the mwb-omarchy-bridge project memory.
+const LISTEN_PORT: u16 = 15101;
+
+fn set_socket_timeouts(stream: &TcpStream) {
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+}
+
+/// Handshake + Mouse/Keyboard receive loop over an already-connected stream.
+/// `cg` is `Some` on the outbound client connection (real forwarding runs
+/// there) and `None` on the inbound reverse-listener side, which only needs
+/// to complete the protocol so Windows sees a healthy pair — mirrors the
+/// Linux build's `role`/`wl: Option<&mut WaylandInput>` split. Deliberately
+/// narrower than the Linux build otherwise: no clipboard/lock/file handling
+/// yet. Returns (via `?`) on any I/O error so the caller reconnects/re-accepts.
+fn run_session(stream: &mut TcpStream, mut cg: Option<&mut CgInput>, cfg: &Config) -> std::io::Result<()> {
+    let magic_number = get_24bit_hash(&cfg.security_key);
+    let key = derive_key(&cfg.security_key);
+    let iv = derive_iv();
+
+    let cipher = CbcState::new(&key);
+    let mut read_chain = iv;
+    let mut write_chain = iv;
+
+    let mut priming_out = [0u8; 16];
+    rand::rng().fill(&mut priming_out);
+    let ct = cipher.encrypt(&mut write_chain, &priming_out);
+    stream.write_all(&ct)?;
+
+    let mut priming_in_ct = [0u8; 16];
+    stream.read_exact(&mut priming_in_ct)?;
+    let _ = cipher.decrypt(&mut read_chain, &priming_in_ct);
+
+    let our_machine1_4: [u32; 4] = {
+        let mut r = rand::rng();
+        [r.random(), r.random(), r.random(), r.random()]
+    };
+    let mut handshake = build_handshake(1, cfg.machine_id, our_machine1_4, &cfg.machine_name);
+    finalize_send_buf(&mut handshake, magic_number);
+    for _ in 0..10 {
+        let ct = cipher.encrypt(&mut write_chain, &handshake);
+        stream.write_all(&ct)?;
+    }
+    let our_flipped: [u32; 4] = our_machine1_4.map(|v| !v);
+    println!("[client] Handshake sent, entering receive loop.");
+
+    let mut kb_state = KeyboardState::new();
+    let mut hi_count = 0u64;
+
+    loop {
+        let mut ct = [0u8; PACKAGE_SIZE];
+        stream.read_exact(&mut ct)?;
+        let mut pt = cipher.decrypt(&mut read_chain, &ct);
+        let package_type = pt[0];
+        let valid = validate_and_clean_recv_buf(&mut pt, magic_number);
+
+        let mut full = pt.clone();
+        if is_big_package(package_type) {
+            let mut ct2 = [0u8; PACKAGE_SIZE];
+            stream.read_exact(&mut ct2)?;
+            let pt2 = cipher.decrypt(&mut read_chain, &ct2);
+            full.extend_from_slice(&pt2);
+        }
+        if !valid {
+            continue;
+        }
+
+        match package_type {
+            PACKAGE_TYPE_HANDSHAKE => {
+                println!("[client] Replying to peer's Handshake with HandshakeAck.");
+                let mut ack = build_handshake_ack(&full, cfg.machine_id, &cfg.machine_name);
+                finalize_send_buf(&mut ack, magic_number);
+                let ct = cipher.encrypt(&mut write_chain, &ack);
+                stream.write_all(&ct)?;
+            }
+            PACKAGE_TYPE_HANDSHAKE_ACK => {
+                let m1 = unpack_u32_le(&full, 16);
+                let m2 = unpack_u32_le(&full, 20);
+                let m3 = unpack_u32_le(&full, 24);
+                let m4 = unpack_u32_le(&full, 28);
+                let matched =
+                    m1 == our_flipped[0] && m2 == our_flipped[1] && m3 == our_flipped[2] && m4 == our_flipped[3];
+                println!("[client] HandshakeAck received, challenge match: {matched}");
+                let peer = String::from_utf8_lossy(&full[32..64]).trim_end().to_string();
+                let detail = if matched { "Connected" } else { "Handshake failed — check the security key" };
+                config::write_status(matched, &peer, detail);
+            }
+            PACKAGE_TYPE_MOUSE => {
+                let x = unpack_u32_le(&full, 16);
+                let y = unpack_u32_le(&full, 20);
+                let wheel = unpack_u32_le(&full, 24);
+                let flags = unpack_u32_le(&full, 28);
+                if let Some(cg) = cg.as_deref_mut() {
+                    handle_mouse(cg, x, y, wheel, flags, cfg.scroll_speed);
+                }
+            }
+            PACKAGE_TYPE_KEYBOARD => {
+                // Offsets verified empirically on the Linux build against
+                // real traffic: wVk at 24, dwFlags at 28.
+                let vk = unpack_u32_le(&full, 24);
+                let flags = unpack_u32_le(&full, 28);
+                if let Some(cg) = cg.as_deref_mut() {
+                    handle_keyboard(cg, &mut kb_state, vk, flags);
+                }
+            }
+            PACKAGE_TYPE_HI => {
+                hi_count += 1;
+                if hi_count % 500 == 1 {
+                    println!("[client] (Hi liveness pings received so far: {hi_count})");
+                }
+            }
+            PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT => {}
+            _ => {}
+        }
+    }
+}
+
+fn run_client(cfg: &Config, cg: &mut CgInput) -> std::io::Result<()> {
+    println!("Connecting to {}...", cfg.windows_ip);
+    config::write_status(false, "", "Connecting...");
+    let mut stream = TcpStream::connect(&cfg.windows_ip)?;
+    set_socket_timeouts(&stream);
+    run_session(&mut stream, Some(cg), cfg)
+}
+
+/// Accepts Windows' own reverse connection back to us — see `LISTEN_PORT`'s
+/// doc comment for why this turned out to matter live. Runs forever in its
+/// own thread; each accepted connection gets its own thread in turn.
+fn run_server_listener(cfg: Config) {
+    let listener = match TcpListener::bind(("0.0.0.0", LISTEN_PORT)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[server] Failed to bind :{LISTEN_PORT} for the reverse connection: {e}");
+            return;
+        }
+    };
+    println!("[server] Listening on :{LISTEN_PORT} for Windows' reverse connection.");
+
+    for conn in listener.incoming() {
+        match conn {
+            Ok(mut stream) => {
+                println!("[server] Accepted connection from {:?}", stream.peer_addr());
+                set_socket_timeouts(&stream);
+                let cfg = cfg.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = run_session(&mut stream, None, &cfg) {
+                        eprintln!("[server] Session ended: {e}");
+                    }
+                });
+            }
+            Err(e) => eprintln!("[server] Accept error: {e}"),
+        }
+    }
+}
+
+fn network_thread(cfg: Config) {
+    {
+        let cfg = cfg.clone();
+        std::thread::spawn(move || run_server_listener(cfg));
+    }
+
+    // CGEventSource/CGEvent creation doesn't require the main thread —
+    // unlike the menu bar UI, which tao/AppKit does require there — so this
+    // runs entirely on its own background thread.
+    let mut cg = CgInput::new();
+    loop {
+        if let Err(e) = run_client(&cfg, &mut cg) {
+            eprintln!("Connection ended: {e}. Reconnecting in 3s...");
+            config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// Writes a starter config.json (with an obviously-fake security key and
+/// Windows host) if none exists yet, so "Edit Config..." always has
+/// something to open rather than erroring on a missing file. Never
+/// overwrites an existing file, even a malformed one — a parse failure
+/// should surface as "fix your edit," not silently discard it.
+fn ensure_config_template() {
+    let path = config::config_path();
+    if path.exists() {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let template = r#"{
+  "security_key": "CHANGE-ME-must-match-PowerToys-Settings-key",
+  "windows_ip": "windows-pc.local:15101",
+  "machine_name": "mac",
+  "machine_id": 2,
+  "scroll_speed": 1.0
+}
+"#;
+    let _ = std::fs::write(&path, template);
+}
+
+fn main() {
+    ensure_config_template();
+
+    std::thread::spawn(|| {
+        let cfg = loop {
+            if let Some(cfg) = config::load_config() {
+                break cfg;
+            }
+            config::write_status(
+                false,
+                "",
+                "Not configured — edit config.json from the menu bar icon, then Restart Connection.",
+            );
+            std::thread::sleep(Duration::from_secs(5));
+        };
+        network_thread(cfg);
+    });
+
+    tray::run();
+}
+
+mod tray;

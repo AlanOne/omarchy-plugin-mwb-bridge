@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alanone.mwb-mac-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__EXECUTABLE_PATH__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Mirrors the Linux build's `Restart=always`/`RestartSec=3` systemd
+         unit: respawn on any exit (crash or otherwise), but ThrottleInterval
+         keeps a fast-crashing binary from being relaunched in a tight loop. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/mwb-mac-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/mwb-mac-bridge.err.log</string>
+</dict>
+</plist>

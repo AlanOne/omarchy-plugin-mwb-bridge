@@ -76,11 +76,10 @@ bugs** below for current rough edges.
 
 ## macOS
 
-**Status: milestone 1 (mouse + keyboard forwarding) working end-to-end,
-live-tested against a real Windows PC.** Not yet ported: clipboard sync,
-lock-both-machines, file transfer, suspend/resume handling, autostart, and
-real `.app` packaging (currently a plain `cargo build`/manual-launch debug
-binary, no code signing). Horizontal scroll's sign isn't independently
+**Status: mouse + keyboard forwarding working end-to-end, packaged as a
+proper autostarting `.app`, both live-tested against a real Windows PC.**
+Not yet ported: clipboard sync, lock-both-machines, file transfer,
+suspend/resume handling. Horizontal scroll's sign isn't independently
 confirmed yet (only vertical was live-tested).
 
 Requires **Accessibility permission** (System Settings > Privacy &
@@ -104,7 +103,26 @@ afterward (not even periodic Hi pings), this is almost certainly why; quit
 PowerToys fully, hand-edit those three fields to match the existing
 entries' format, relaunch.
 
-Build and run from `daemon/`:
+**Install (builds, packages as `~/Applications/MWB Mac Bridge.app`, and
+registers a LaunchAgent so it starts at login and auto-restarts on
+crash — the counterpart to the Linux build's systemd `--user` service):**
+
+```sh
+bash daemon/macos/packaging/install.sh
+```
+
+Re-run it any time after pulling changes to rebuild and reinstall in place.
+First run needs a one-time manual step (can't be scripted — it's a macOS
+security gate): add `MWB Mac Bridge.app` in System Settings > Privacy &
+Security > Accessibility. It won't necessarily be listed automatically
+until it's actually tried to post an input event — use the **+** button
+and browse to `~/Applications/MWB Mac Bridge.app` if it's missing. Ad-hoc
+code signing (no paid Apple Developer account needed) means this grant may
+need re-confirming after a rebuild, since the signature changes each time
+— see the comment in `install.sh` for the stable-signing alternative if
+that gets annoying.
+
+For quick iteration without the full install (no autostart, no bundle):
 
 ```sh
 cargo run -p mwb_mac_bridge

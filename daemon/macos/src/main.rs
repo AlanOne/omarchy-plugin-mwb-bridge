@@ -2,12 +2,11 @@
 // (crypto, framing, handshake, VK->evdev translation, mouse/keyboard
 // decoding) is unchanged, shared code from `mwb_protocol` — this file is
 // mostly platform wiring: the TCP connect/reconnect loop and a status-item
-// menu bar app. Mouse/keyboard forwarding and clipboard sync (text, and
-// images both small- and big-path) are ported; lock-both-machines, plain
-// file transfer, and suspend/resume handling are deliberately not yet —
-// see the mwb-omarchy-bridge project memory's "macOS port" section for the
-// full remaining list, being added incrementally the same way the Linux
-// build was.
+// menu bar app. Mouse/keyboard forwarding, clipboard sync (text, and images
+// both small- and big-path), and lock-both-machines are ported; plain file
+// transfer and suspend/resume handling are deliberately not yet — see the
+// mwb-omarchy-bridge project memory's "macOS port" section for the full
+// remaining list, being added incrementally the same way the Linux build was.
 
 mod cg_input;
 mod clipboard;
@@ -19,7 +18,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use mwb_protocol::config::{self, Config};
-use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, LLKHF_UP};
 use mwb_protocol::mwb_protocol::*;
 use rand::RngExt;
 
@@ -96,6 +95,7 @@ fn run_session(
     println!("[client] Handshake sent, entering receive loop.");
 
     let mut kb_state = KeyboardState::new();
+    let mut lock_combo = LockComboDetector::new();
     let mut hi_count = 0u64;
     let mut clipboard_buf: Vec<u8> = Vec::new();
     let mut clipboard_kind: Option<u8> = None;
@@ -199,6 +199,10 @@ fn run_session(
                 // real traffic: wVk at 24, dwFlags at 28.
                 let vk = unpack_u32_le(&full, 24);
                 let flags = unpack_u32_le(&full, 28);
+                if lock_combo.observe(vk, (flags & LLKHF_UP) == 0) {
+                    println!("[client] Windows' lock-both-machines combo detected — locking this machine too.");
+                    cg_input::lock_screen();
+                }
                 if let Some(cg) = cg.as_deref_mut() {
                     handle_keyboard(cg, &mut kb_state, vk, flags);
                 }

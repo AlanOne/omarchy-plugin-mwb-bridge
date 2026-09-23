@@ -77,16 +77,26 @@ bugs** below for current rough edges.
 ## macOS
 
 **Status: mouse + keyboard forwarding (including window dragging and
-double-click-to-zoom) and clipboard sync — text and images, both
-directions, both size paths (small inline path and the >1MB big-path
-connection, confirmed with a real 2MB screenshot) — all working end-to-end,
-packaged as a proper autostarting `.app`, all live-tested against a real
-Windows PC.** Not yet ported: plain file copy/paste (any file, not just
-images), lock-both-machines, suspend/resume handling. Horizontal scroll's
-sign isn't independently confirmed yet (only vertical was live-tested).
-Big-path image sync is independently confirmed inbound (Windows -> Mac)
-but not yet outbound (the Mac -> Windows code path is symmetric but
-untested with a genuinely >1MB Mac-side image).
+double-click-to-zoom), clipboard sync (text and images, both directions,
+both size paths — confirmed with a real 2MB screenshot), and
+lock-both-machines all working end-to-end, packaged as a proper
+autostarting `.app`, all live-tested against a real Windows PC.** Not yet
+ported: plain file copy/paste (any file, not just images), suspend/resume
+handling. Horizontal scroll's sign isn't independently confirmed yet (only
+vertical was live-tested). Big-path image sync is independently confirmed
+inbound (Windows -> Mac) but not yet outbound (the Mac -> Windows code path
+is symmetric but untested with a genuinely >1MB Mac-side image).
+
+**Locking this machine** (in response to Windows' own lock-both-machines
+double-tap) works differently here than on Linux — macOS 26 removed the
+classic `CGSession -suspend` trick entirely, and there's no direct public
+API for this. Implemented instead by synthesizing the system-wide
+`Cmd+Ctrl+Q` "Lock Screen" shortcut via `CGEventPost` — but **posted at
+`CGEventTapLocation::Session`, not `HID`** (confirmed live: `HID`, what
+every other event in this codebase uses, silently doesn't trigger this
+particular global shortcut; `Session` does). See `cg_input.rs`'s
+`lock_screen` for the full story, including two other approaches ruled out
+live first.
 
 **Note on clipboard content types**: copying an image *file* (Explorer/
 Finder "Copy" on a `.png` on disk) is a different clipboard content type

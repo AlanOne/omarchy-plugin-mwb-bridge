@@ -293,3 +293,46 @@ impl InputSink for CgInput {
         self.flags = flags;
     }
 }
+
+/// Locks this machine's session, in response to Windows' own lock-both-
+/// machines double-tap (see `mwb_protocol::input_handling::LockComboDetector`).
+/// The classic `CGSession -suspend` trick (`/System/Library/CoreServices/
+/// Menu Extras/User.menu/Contents/Resources/CGSession`) — long the standard
+/// answer for this — **no longer exists on macOS 26** (confirmed live,
+/// 2026-09-23: that path is simply gone). The modern equivalent is the
+/// system-wide `Cmd+Ctrl+Q` "Lock Screen" shortcut (Apple menu > Lock
+/// Screen; a keyboard shortcut since macOS Ventura), synthesized here via
+/// the same `CGEventPost` mechanism the rest of this module already uses —
+/// deliberately *not* `osascript`/AppleScript's `System Events` keystroke
+/// trick, which would need its own separate Automation permission grant;
+/// this needs nothing beyond the Accessibility grant already in place.
+///
+/// **Posted at `CGEventTapLocation::Session`, not `HID`** — confirmed live,
+/// 2026-09-23: `HID` (what every other event this module posts uses, and
+/// the first thing tried here) silently did not trigger the Lock Screen
+/// global shortcut at all, while `Session` did, immediately. `HID` is the
+/// lowest-level tap (before the WindowServer sees anything); Apple's
+/// Symbolic Hotkeys manager for a system-wide shortcut like this
+/// apparently only watches from `Session` level, unlike ordinary
+/// mouse/keyboard input forwarding, which works fine via `HID`. Also ruled
+/// out live: `open -a ScreenSaverEngine` (starts the screensaver but
+/// doesn't require a password to dismiss on this Mac's current settings,
+/// so not equivalent to a real lock here).
+///
+/// Uses its own fresh `CGEventSource` rather than a live `CgInput`'s, so it
+/// can't interfere with that instance's own tracked modifier-flag state.
+pub fn lock_screen() {
+    const KEY_Q: core_graphics::event::CGKeyCode = 0x0C; // kVK_ANSI_Q
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        eprintln!("(lock: failed to create CGEventSource)");
+        return;
+    };
+    for pressed in [true, false] {
+        let Ok(event) = CGEvent::new_keyboard_event(source.clone(), KEY_Q, pressed) else {
+            eprintln!("(lock: failed to create keyboard event)");
+            return;
+        };
+        event.set_flags(CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagControl);
+        event.post(CGEventTapLocation::Session);
+    }
+}

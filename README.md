@@ -77,11 +77,23 @@ bugs** below for current rough edges.
 ## macOS
 
 **Status: mouse + keyboard forwarding (including window dragging and
-double-click-to-zoom) and clipboard text sync (both directions) working
-end-to-end, packaged as a proper autostarting `.app`, all live-tested
-against a real Windows PC.** Not yet ported: clipboard images, file
-transfer, lock-both-machines, suspend/resume handling. Horizontal scroll's
+double-click-to-zoom) and clipboard sync — text and images, both
+directions, both size paths (small inline path and the >1MB big-path
+connection, confirmed with a real 2MB screenshot) — all working end-to-end,
+packaged as a proper autostarting `.app`, all live-tested against a real
+Windows PC.** Not yet ported: plain file copy/paste (any file, not just
+images), lock-both-machines, suspend/resume handling. Horizontal scroll's
 sign isn't independently confirmed yet (only vertical was live-tested).
+Big-path image sync is independently confirmed inbound (Windows -> Mac)
+but not yet outbound (the Mac -> Windows code path is symmetric but
+untested with a genuinely >1MB Mac-side image).
+
+**Note on clipboard content types**: copying an image *file* (Explorer/
+Finder "Copy" on a `.png` on disk) is a different clipboard content type
+(a file reference) from "copy image" (a screenshot tool, or Preview/an
+app's Edit > Copy) — only the latter is what clipboard image sync applies
+to. A file-copy test will correctly report "not supported" rather than
+silently doing nothing.
 
 Menu bar icon is a simple procedurally-drawn double-headed arrow
 (`macos/src/tray.rs`'s `bridge_icon`), rendered as a template image so it

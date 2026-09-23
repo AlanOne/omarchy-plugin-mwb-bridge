@@ -2,11 +2,12 @@
 // (crypto, framing, handshake, VK->evdev translation, mouse/keyboard
 // decoding) is unchanged, shared code from `mwb_protocol` — this file is
 // mostly platform wiring: the TCP connect/reconnect loop and a status-item
-// menu bar app. Mouse/keyboard forwarding and clipboard text sync are
-// ported; lock-both-machines, file transfer, image clipboard, and
-// suspend/resume handling are deliberately not yet — see the
-// mwb-omarchy-bridge project memory's "macOS port" section for the full
-// remaining list, being added incrementally the same way the Linux build was.
+// menu bar app. Mouse/keyboard forwarding and clipboard sync (text, and
+// images both small- and big-path) are ported; lock-both-machines, plain
+// file transfer, and suspend/resume handling are deliberately not yet —
+// see the mwb-omarchy-bridge project memory's "macOS port" section for the
+// full remaining list, being added incrementally the same way the Linux
+// build was.
 
 mod cg_input;
 mod clipboard;
@@ -104,18 +105,42 @@ fn run_session(
     let mut next_clip_id: u32 = 1000;
 
     loop {
-        if let Some((clip_rx, _)) = clipboard.as_ref() {
+        if let Some((clip_rx, shared)) = clipboard.as_ref() {
             let mut latest = None;
             while let Ok(ev) = clip_rx.try_recv() {
                 latest = Some(ev); // coalesce rapid successive changes to the last one
             }
-            if let Some(ClipboardEvent::Text(text)) = latest {
-                for mut pkg in build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text) {
-                    finalize_send_buf(&mut pkg, magic_number);
-                    let ct = cipher.encrypt(&mut write_chain, &pkg);
-                    stream.write_all(&ct)?;
+            match latest {
+                Some(ClipboardEvent::Text(text)) => {
+                    for mut pkg in build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text) {
+                        finalize_send_buf(&mut pkg, magic_number);
+                        let ct = cipher.encrypt(&mut write_chain, &pkg);
+                        stream.write_all(&ct)?;
+                    }
+                    println!("[client] Sent clipboard text ({} chars) to peer.", text.chars().count());
                 }
-                println!("[client] Sent clipboard text ({} chars) to peer.", text.chars().count());
+                Some(ClipboardEvent::Image(png_bytes)) => {
+                    let len = png_bytes.len();
+                    for mut pkg in build_clipboard_image_packages(&mut next_clip_id, cfg.machine_id, &png_bytes) {
+                        finalize_send_buf(&mut pkg, magic_number);
+                        let ct = cipher.encrypt(&mut write_chain, &pkg);
+                        stream.write_all(&ct)?;
+                    }
+                    println!("[client] Sent clipboard image ({len} bytes) to peer.");
+                }
+                Some(ClipboardEvent::BigImage(path)) => {
+                    *clipboard::pending_outbound_image(shared).lock().unwrap() = Some(path);
+                    clipboard::announce_big_image(
+                        stream,
+                        &cipher,
+                        &mut write_chain,
+                        magic_number,
+                        cfg.machine_id,
+                        clipboard::peer_machine_id(shared),
+                    )?;
+                    println!("[client] Announced a big clipboard image to peer (served if/when it connects to pull it).");
+                }
+                None => {}
             }
         }
 
@@ -134,6 +159,10 @@ fn run_session(
         }
         if !valid {
             continue;
+        }
+        let src_id = unpack_u32_le(&full, 8);
+        if let Some((_, shared)) = clipboard.as_ref() {
+            shared.note_peer_machine_id(src_id);
         }
 
         match package_type {
@@ -174,22 +203,45 @@ fn run_session(
                     handle_keyboard(cg, &mut kb_state, vk, flags);
                 }
             }
-            PACKAGE_TYPE_CLIPBOARD_TEXT => {
-                // Bytes 16-63 of a ClipboardText package are one contiguous
-                // 48-byte raw-data chunk (not Machine1-4 + MachineName,
-                // despite the same package size) — see PROTOCOL.md's
-                // clipboard section.
+            PACKAGE_TYPE_CLIPBOARD_TEXT | PACKAGE_TYPE_CLIPBOARD_IMAGE => {
+                // Bytes 16-63 of a ClipboardText/ClipboardImage package are
+                // one contiguous 48-byte raw-data chunk (not Machine1-4 +
+                // MachineName, despite the same package size) — see
+                // PROTOCOL.md's clipboard section.
                 clipboard_buf.extend_from_slice(&full[16..64]);
                 clipboard_kind = Some(package_type);
             }
             PACKAGE_TYPE_CLIPBOARD_DATA_END => {
-                if clipboard_kind == Some(PACKAGE_TYPE_CLIPBOARD_TEXT) {
-                    if let Some((_, shared)) = clipboard.as_ref() {
-                        clipboard::apply_incoming_clipboard_text(&clipboard_buf, shared);
+                if let Some((_, shared)) = clipboard.as_ref() {
+                    match clipboard_kind {
+                        Some(PACKAGE_TYPE_CLIPBOARD_TEXT) => clipboard::apply_incoming_clipboard_text(&clipboard_buf, shared),
+                        Some(PACKAGE_TYPE_CLIPBOARD_IMAGE) => clipboard::apply_incoming_clipboard_image(&clipboard_buf, shared),
+                        _ => {}
                     }
                 }
                 clipboard_buf.clear();
                 clipboard_kind = None;
+            }
+            PACKAGE_TYPE_CLIPBOARD => {
+                // The "beat" announcing big-path content is available.
+                // Real MWB only auto-pulls this around its own
+                // machine-switch event; this bridge's fixed two-machine
+                // topology has no equivalent, so treat any beat as "pull
+                // immediately" instead — see PROTOCOL.md. Spawned in its
+                // own thread since a full pull over a fresh connection
+                // could take a while and shouldn't block this connection's
+                // own receive loop.
+                if let Some((_, shared)) = clipboard.as_ref() {
+                    println!("[client] Received a big-path-available beat, pulling now.");
+                    let cfg = cfg.clone();
+                    let shared = (*shared).clone();
+                    let peer_addr = stream.peer_addr().ok();
+                    std::thread::spawn(move || {
+                        if let Err(e) = clipboard::pull_image_from_windows(&cfg, peer_addr, &shared) {
+                            eprintln!("(clipboard: big-path pull failed: {e})");
+                        }
+                    });
+                }
             }
             PACKAGE_TYPE_HI => {
                 hi_count += 1;
@@ -257,6 +309,11 @@ fn network_thread(cfg: Config) {
     {
         let clip_shared = clip_shared.clone();
         std::thread::spawn(move || clipboard::run_clipboard_watcher(clip_tx, clip_shared));
+    }
+    {
+        let cfg = cfg.clone();
+        let pending = clipboard::pending_outbound_image(&clip_shared);
+        std::thread::spawn(move || clipboard::run_file_server_listener(cfg, pending));
     }
 
     // CGEventSource/CGEvent creation doesn't require the main thread —

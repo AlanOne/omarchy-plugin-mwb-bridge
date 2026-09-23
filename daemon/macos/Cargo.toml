@@ -13,3 +13,4 @@ muda = "0.15"
 tao = "0.30"
 arboard = "3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -1361,6 +1361,7 @@ dependencies = [
  "core-foundation",
  "core-graphics",
  "flate2",
+ "image",
  "muda",
  "mwb_protocol",
  "rand",

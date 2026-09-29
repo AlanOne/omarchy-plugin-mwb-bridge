@@ -108,6 +108,16 @@ pub fn apply_incoming_clipboard_text(compressed: &[u8], shared: &ClipboardShared
 
     let Some(text) = decoded.split(CLIPBOARD_SEP).find_map(|frag| frag.strip_prefix("TXT")) else {
         eprintln!("(clipboard: no TXT fragment in incoming data, ignoring)");
+        // TEMP diagnostic: shape only (tag + length per fragment, first
+        // chars' code points), never the clipboard content itself.
+        let shape: Vec<String> = decoded
+            .split(CLIPBOARD_SEP)
+            .map(|f| {
+                let head: Vec<String> = f.chars().take(4).map(|c| format!("{:04x}", c as u32)).collect();
+                format!("[len={} head={}]", f.chars().count(), head.join(" "))
+            })
+            .collect();
+        eprintln!("(clipboard diag: inflated={}B fragments={})", inflated.len(), shape.join(" "));
         return;
     };
 
@@ -177,14 +187,24 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
 /// macOS -> Windows clipboard sync: polls the local clipboard (no simple
 /// blocking "notify me on change" primitive here either, same as
 /// `wl-clipboard`'s CLI tools on Linux) and forwards genuinely new content
-/// into `clip_tx`. Checks for an image first each tick (matching the Linux
-/// build's file > image > text priority, minus the file case this
-/// milestone doesn't implement), falling back to text.
+/// into `clip_tx`. Same file > image > text priority as the Linux build,
+/// except files are only detected (and skipped), not sent.
 pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShared) {
     let mut last_seen_image = read_local_clipboard_image_rgba();
     let mut last_seen_text = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
     loop {
         std::thread::sleep(Duration::from_millis(500));
+
+        // A Finder file copy also puts the file's *icon* on the pasteboard
+        // as TIFF (and its name as plain text) — reading either would send
+        // Windows a picture of a generic document icon, or a bare filename,
+        // clobbering its clipboard with something the user never meant to
+        // copy. File transfer isn't ported, so leave Windows' clipboard
+        // alone entirely while files are what's on ours.
+        let has_files = Clipboard::new().ok().and_then(|mut cb| cb.get().file_list().ok()).is_some_and(|f| !f.is_empty());
+        if has_files {
+            continue;
+        }
 
         let current_image = read_local_clipboard_image_rgba();
         if let Some((width, height, ref raw)) = current_image {

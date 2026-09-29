@@ -107,9 +107,14 @@ pub fn apply_incoming_clipboard_text(compressed: &[u8], shared: &ClipboardShared
     let decoded = String::from_utf16_lossy(&utf16);
 
     let Some(text) = decoded.split(CLIPBOARD_SEP).find_map(|frag| frag.strip_prefix("TXT")) else {
-        eprintln!("(clipboard: no TXT fragment in incoming data, ignoring)");
-        // TEMP diagnostic: shape only (tag + length per fragment, first
-        // chars' code points), never the clipboard content itself.
+        // Some Windows copies (seen live from a browser, 2026-09-29) arrive
+        // as an `HTM` fragment only — CF_HTML, no plain-text fragment at
+        // all. Apply those as HTML plus a tag-stripped plain-text
+        // alternative, so both rich and plain paste targets get something.
+        if let Some(cf_html) = decoded.split(CLIPBOARD_SEP).find_map(|frag| frag.strip_prefix("HTM")) {
+            apply_incoming_clipboard_html(cf_html, shared);
+            return;
+        }
         let shape: Vec<String> = decoded
             .split(CLIPBOARD_SEP)
             .map(|f| {
@@ -117,7 +122,9 @@ pub fn apply_incoming_clipboard_text(compressed: &[u8], shared: &ClipboardShared
                 format!("[len={} head={}]", f.chars().count(), head.join(" "))
             })
             .collect();
-        eprintln!("(clipboard diag: inflated={}B fragments={})", inflated.len(), shape.join(" "));
+        // Shape only (tag + length per fragment, first chars' code points),
+        // never the clipboard content itself.
+        eprintln!("(clipboard: no TXT or HTM fragment in incoming data, ignoring: inflated={}B fragments={})", inflated.len(), shape.join(" "));
         return;
     };
 
@@ -128,6 +135,70 @@ pub fn apply_incoming_clipboard_text(compressed: &[u8], shared: &ClipboardShared
         }
         Err(e) => eprintln!("(clipboard: failed to set local clipboard: {e})"),
     }
+}
+
+/// Applies a CF_HTML payload (`Version:...` header lines, then the HTML
+/// document with the copied part between `<!--StartFragment-->` and
+/// `<!--EndFragment-->`). The header's StartFragment/EndFragment byte
+/// offsets aren't used — they count UTF-8 bytes of Windows' original
+/// buffer, which doesn't survive MWB's UTF-16 round trip reliably; the
+/// comment markers are part of the CF_HTML spec and always present.
+fn apply_incoming_clipboard_html(cf_html: &str, shared: &ClipboardShared) {
+    let fragment = match (cf_html.find("<!--StartFragment-->"), cf_html.find("<!--EndFragment-->")) {
+        (Some(a), Some(b)) if a < b => &cf_html[a + "<!--StartFragment-->".len()..b],
+        _ => cf_html.find('<').map_or(cf_html, |i| &cf_html[i..]),
+    };
+    let plain = html_to_plain_text(fragment);
+    match Clipboard::new().and_then(|mut cb| cb.set_html(fragment, Some(plain.as_str()))) {
+        Ok(()) => {
+            // The watcher sees the plain-text alternative via get_text() —
+            // record it so that isn't bounced back to Windows as new.
+            println!("(clipboard: applied {} chars of HTML from Windows, {} chars plain-text alternative)", fragment.chars().count(), plain.chars().count());
+            *shared.last_applied_text.lock().unwrap() = Some(plain);
+        }
+        Err(e) => eprintln!("(clipboard: failed to set local clipboard HTML: {e})"),
+    }
+}
+
+/// Crude but adequate HTML-to-text for the plain-text alternative: block
+/// ends become newlines, tags are dropped, the common entities decoded,
+/// runs of blank lines collapsed. Not a real HTML parser — rich targets get
+/// the actual HTML anyway; this only needs to be sensible in a plain one.
+fn html_to_plain_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let Some(gt) = rest[lt..].find('>') else {
+            rest = "";
+            break;
+        };
+        let tag = rest[lt + 1..lt + gt].trim_start_matches('/').to_ascii_lowercase();
+        let name = tag.split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or("");
+        let is_block = matches!(name, "br" | "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+        if is_block && !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        rest = &rest[lt + gt + 1..];
+    }
+    out.push_str(rest);
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    let mut lines: Vec<&str> = Vec::new();
+    for line in decoded.lines().map(str::trim) {
+        if !(line.is_empty() && lines.last().is_none_or(|l| l.is_empty())) {
+            lines.push(line);
+        }
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 /// Applies received clipboard-image bytes directly to the local clipboard.
@@ -184,6 +255,34 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
     Some(png_bytes)
 }
 
+/// Downscales an image until its PNG encoding fits the small path, for
+/// images whose full-resolution PNG doesn't. The big path is the "right"
+/// transport for these, but Windows never connects back to pull an image
+/// this bridge announces (same unresolved wall as the Linux build — see the
+/// project notes' "File/big-image transfer back to Windows"; confirmed live
+/// on macOS 2026-09-29: two announcements, zero pulls), so a full-size
+/// Retina screenshot otherwise never arrives at all. Arriving at reduced
+/// resolution beats not arriving. First guess assumes PNG size scales with
+/// pixel count; each retry shrinks a further 20%. `None` only if even that
+/// fails (caller falls back to the big-path announcement).
+fn shrink_png_to_fit(width: usize, height: usize, rgba: &[u8], full_png_len: usize) -> Option<Vec<u8>> {
+    use image::{imageops, RgbaImage};
+    let full = RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())?;
+    let mut scale = ((MAX_SMALL_PATH_SIZE as f64 / full_png_len as f64).sqrt() * 0.95).min(0.95);
+    for _ in 0..8 {
+        let w = ((width as f64 * scale).round() as u32).max(1);
+        let h = ((height as f64 * scale).round() as u32).max(1);
+        let resized = imageops::resize(&full, w, h, imageops::FilterType::Triangle);
+        let png = encode_png(w as usize, h as usize, resized.as_raw())?;
+        if png.len() < MAX_SMALL_PATH_SIZE {
+            println!("(clipboard: image too big for the small path ({full_png_len} bytes at {width}x{height}), sending it downscaled to {w}x{h}, {} bytes)", png.len());
+            return Some(png);
+        }
+        scale *= 0.8;
+    }
+    None
+}
+
 /// macOS -> Windows clipboard sync: polls the local clipboard (no simple
 /// blocking "notify me on change" primitive here either, same as
 /// `wl-clipboard`'s CLI tools on Linux) and forwards genuinely new content
@@ -215,6 +314,8 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
                     if let Some(png_bytes) = encode_png(width, height, raw) {
                         if png_bytes.len() < MAX_SMALL_PATH_SIZE {
                             let _ = clip_tx.send(ClipboardEvent::Image(png_bytes));
+                        } else if let Some(small) = shrink_png_to_fit(width, height, raw, png_bytes.len()) {
+                            let _ = clip_tx.send(ClipboardEvent::Image(small));
                         } else {
                             let dir = cache_dir();
                             if std::fs::create_dir_all(&dir).is_ok() {
@@ -333,13 +434,11 @@ fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8;
 }
 
 /// Connects to Windows' separate clipboard-server socket (port 15100) to
-/// pull a big-path image it just announced via a beat on the message
-/// server, and applies it to the local clipboard once fully received.
-/// Mirrors the Linux build's `pull_file_from_windows`, narrowed to the
-/// image case only (this milestone doesn't implement plain file
-/// copy/paste) — a non-image payload is logged and discarded rather than
-/// silently mishandled.
-pub fn pull_image_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &ClipboardShared) -> std::io::Result<()> {
+/// pull whatever it just announced via a beat on the message server — a
+/// big-path image (header name `"image"`) or a copied file (header name =
+/// its full Windows path) — and applies it to the local clipboard once
+/// fully received. Mirrors the Linux build's `pull_file_from_windows`.
+pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &ClipboardShared) -> std::io::Result<()> {
     use std::io::Write;
     let mut stream = match peer_addr {
         Some(addr) => TcpStream::connect(with_port(addr, FILE_LISTEN_PORT))?,
@@ -385,10 +484,40 @@ pub fn pull_image_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shar
     if name == BIG_PATH_IMAGE_NAME {
         apply_incoming_clipboard_image(&body, shared);
         println!("[image-pull] Received a big clipboard image ({size} bytes) from Windows.");
-    } else {
-        println!("[image-pull] Windows offered {name:?} ({size} bytes) — not an image, and plain file transfer isn't supported on macOS yet, discarding.");
+        return Ok(());
+    }
+
+    let dir = received_files_dir();
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(safe_file_name(&name));
+    std::fs::write(&dest, &body)?; // fully flushed before the clipboard is touched below
+    match Clipboard::new().and_then(|mut cb| cb.set().file_list(&[&dest])) {
+        Ok(()) => println!("[file-pull] Received {:?} ({size} bytes) from Windows -> {}", dest.file_name().unwrap_or_default(), dest.display()),
+        Err(e) => eprintln!("[file-pull] Saved {} but failed to put it on the clipboard: {e}", dest.display()),
     }
     Ok(())
+}
+
+/// Where files received from Windows get written before being placed on
+/// the clipboard (as a file URL, same as a Finder copy — pasting in Finder
+/// copies it out of here). Same scheme as the Linux build's
+/// `~/.cache/omarchy-mwb-bridge-files`; a later file with the same name
+/// overwrites the earlier one, also as on Linux.
+fn received_files_dir() -> PathBuf {
+    cache_dir().join("received-files")
+}
+
+/// The header's `name` is a full Windows path (`C:\Users\...\file.txt`) —
+/// `Path::file_name` only splits on `/` here, so split on both manually
+/// (the Linux build hit this live: a file landed named with the literal
+/// full path). Also refuses `.`/`..`/empty, which would otherwise make
+/// `dir.join` resolve outside the received-files directory.
+fn safe_file_name(windows_path: &str) -> String {
+    let base = windows_path.rsplit(['/', '\\']).next().unwrap_or(windows_path).trim();
+    match base {
+        "" | "." | ".." => "received-file".to_string(),
+        _ => base.to_string(),
+    }
 }
 
 /// Serves the pending big-path image to a peer that just connected to our

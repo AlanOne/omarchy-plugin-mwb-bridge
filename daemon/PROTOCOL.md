@@ -446,6 +446,16 @@ via the big path as real image bytes on the clipboard, not a stray file.
 
 ### Big path (file transfer): what's implemented, and two real bugs found live
 
+**Outbound (to Windows) never triggers a pull, on either platform.**
+Reproduced independently from the macOS build on 2026-09-29: two big-path
+image announcements (beat, then `HideMouse` + `MachineSwitched`), zero
+connections from Windows to port 15100. Since a different OS and network
+stack hit the identical wall, the cause is almost certainly on the Windows
+side (some precondition in real MWB's pull logic this bridge doesn't meet),
+not anything Linux-specific. The macOS build works around it for images by
+downscaling until the PNG fits the small path; files have no such
+workaround (real MWB always sends them big-path).
+
 **Only "copy a file, paste it elsewhere" is implemented — not visual
 drag-and-drop.** Real MWB has two genuinely separate trigger paths that
 both end up at the same big-path transfer mechanism: a normal file copy

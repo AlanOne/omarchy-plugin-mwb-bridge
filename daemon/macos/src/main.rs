@@ -241,7 +241,7 @@ fn run_session(
                     let shared = (*shared).clone();
                     let peer_addr = stream.peer_addr().ok();
                     std::thread::spawn(move || {
-                        if let Err(e) = clipboard::pull_image_from_windows(&cfg, peer_addr, &shared) {
+                        if let Err(e) = clipboard::pull_from_windows(&cfg, peer_addr, &shared) {
                             eprintln!("(clipboard: big-path pull failed: {e})");
                         }
                     });

@@ -76,16 +76,35 @@ bugs** below for current rough edges.
 
 ## macOS
 
-**Status: mouse + keyboard forwarding (including window dragging and
-double-click-to-zoom), clipboard sync (text and images, both directions,
-both size paths — confirmed with a real 2MB screenshot), and
-lock-both-machines all working end-to-end, packaged as a proper
-autostarting `.app`, all live-tested against a real Windows PC.** Not yet
-ported: plain file copy/paste (any file, not just images), suspend/resume
-handling. Horizontal scroll's sign isn't independently confirmed yet (only
-vertical was live-tested). Big-path image sync is independently confirmed
-inbound (Windows -> Mac) but not yet outbound (the Mac -> Windows code path
-is symmetric but untested with a genuinely >1MB Mac-side image).
+**Status: mouse + keyboard forwarding (including window dragging,
+double-click-to-zoom and held-key auto-repeat), clipboard sync (plain text,
+HTML-only copies, and images, both directions), Windows -> Mac file
+copy/paste, and lock-both-machines all working end-to-end, packaged as a
+proper autostarting `.app`, all live-tested against a real Windows PC.**
+Not ported: suspend/resume handling.
+
+**Mac -> Windows is limited to the small (<1MB) transfer path**, the same
+unresolved wall as the Linux build (see `daemon/PROTOCOL.md`'s big-path section):
+Windows never connects back to pull anything this bridge announces for the
+big path. Consequences:
+- **Images over 1MB are sent downscaled** until their PNG fits (e.g. a
+  busy 2560x1440 screenshot arrives around 1046x588) — reduced resolution
+  rather than not arriving at all.
+- **Mac -> Windows file copy isn't possible** — real MWB always sends files
+  over the big path. Copying a file in Finder leaves Windows' clipboard
+  untouched (instead of sending the file's icon, which a Finder copy also
+  puts on the pasteboard).
+
+**Windows -> Mac files** are saved to
+`~/Library/Caches/mwb-mac-bridge/received-files/` and put on the clipboard
+as a file, so pasting in Finder copies them out. One file per copy, 100MB
+max, no folders — real MWB's own limits. A later file with the same name
+overwrites the earlier one.
+
+**HTML-only copies**: some Windows copies (seen from a browser) arrive as
+HTML with no plain-text version. These are applied as HTML plus a
+tag-stripped plain-text alternative, so rich and plain paste targets both
+get something sensible.
 
 **Locking this machine** (in response to Windows' own lock-both-machines
 double-tap) works differently here than on Linux — macOS 26 removed the
@@ -101,9 +120,10 @@ live first.
 **Note on clipboard content types**: copying an image *file* (Explorer/
 Finder "Copy" on a `.png` on disk) is a different clipboard content type
 (a file reference) from "copy image" (a screenshot tool, or Preview/an
-app's Edit > Copy) — only the latter is what clipboard image sync applies
-to. A file-copy test will correctly report "not supported" rather than
-silently doing nothing.
+app's Edit > Copy) — the former goes through file copy (Windows -> Mac
+only), the latter through clipboard image sync. On the Mac, Cmd+Shift+3
+saves a screenshot to a file; **Cmd+Ctrl+Shift+3** is the one that copies
+it to the clipboard (Win+Ctrl+Shift+3 on the Windows keyboard).
 
 Menu bar icon is a simple procedurally-drawn double-headed arrow
 (`macos/src/tray.rs`'s `bridge_icon`), rendered as a template image so it

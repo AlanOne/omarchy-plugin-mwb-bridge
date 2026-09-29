@@ -261,6 +261,24 @@ impl InputSink for CgInput {
         event.post(CGEventTapLocation::HID);
     }
 
+    /// Forwards one of Windows' auto-repeat key-downs as a key-down with the
+    /// autorepeat field set — what a real Mac keyboard's repeats look like
+    /// to apps (some treat a repeat differently from a fresh press). Repeat
+    /// delay/rate therefore follow the Windows machine's keyboard settings,
+    /// not this Mac's.
+    fn key_repeat(&mut self, evdev_code: u32) {
+        let Some(keycode) = evdev_to_cgkeycode(evdev_code) else {
+            return;
+        };
+        let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, true) else {
+            eprintln!("(cg_input: failed to create keyboard event)");
+            return;
+        };
+        event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
+        event.set_flags(self.flags);
+        event.post(CGEventTapLocation::HID);
+    }
+
     /// Converts the generic `ModifierState` into `CGEventFlags`, stored and
     /// applied to every subsequent event this sink posts (CGEventPost has no
     /// separate "set modifier state" call the way the Wayland virtual-

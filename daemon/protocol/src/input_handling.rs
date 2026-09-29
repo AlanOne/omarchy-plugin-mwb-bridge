@@ -92,6 +92,13 @@ pub trait InputSink {
     fn scroll_vertical(&mut self, value: f64);
     fn scroll_horizontal(&mut self, value: f64);
     fn key(&mut self, evdev_code: u32, pressed: bool);
+    /// Called for each of Windows' auto-repeat "down" packets for a key
+    /// that's already held (never for modifiers). Default: ignore — right
+    /// for a receiver whose own OS generates repeat for a held injected key
+    /// (Wayland compositors do). An impl whose OS *doesn't* repeat injected
+    /// keys (macOS: key repeat comes from the HID layer for real hardware
+    /// only, a posted CGEvent key-down never repeats) forwards these instead.
+    fn key_repeat(&mut self, _evdev_code: u32) {}
     /// Called whenever tracked modifier state changes, before the `key()`
     /// call for the triggering keypress. Also called (with `numlock: true`)
     /// on every numpad key so an impl that needs to force numpad-producing
@@ -275,17 +282,20 @@ pub fn handle_keyboard(sink: &mut impl InputSink, state: &mut KeyboardState, vk:
 
     // Windows forwards its own OS-level auto-repeat "down" messages for a
     // held key — a real, expected part of the wire protocol, not a bug on
-    // its end. Only forward the actual press/release *transition*; a held
-    // key generating repeat characters is the receiving OS's own repeat
-    // timer's job once it sees the first press, same as a real local
-    // keyboard (whose driver never re-sends "pressed" for a key that's
-    // still down either). Forwarding every one of Windows' repeat packets
-    // as a fresh press compounds with the receiver's own repeat, producing
-    // far more characters than intended for any key held even slightly too
-    // long. Releases always forward regardless of tracked state, so a
-    // missed/out-of-order press can never leave a key stuck.
+    // its end. Only the actual press/release *transition* goes to `key()`;
+    // repeats go to `key_repeat()` instead, which each sink handles per its
+    // OS. On Linux a held key generating repeat characters is the
+    // compositor's own repeat timer's job once it sees the first press
+    // (forwarding Windows' repeats there as fresh presses compounds with
+    // it, producing far more characters than intended), so that sink
+    // ignores them; macOS never repeats an injected key on its own, so that
+    // sink forwards them. Releases always forward regardless of tracked
+    // state, so a missed/out-of-order press can never leave a key stuck.
     if pressed {
         if !state.pressed_keys.insert(evdev_code) {
+            if !is_mod {
+                sink.key_repeat(evdev_code);
+            }
             return;
         }
     } else {

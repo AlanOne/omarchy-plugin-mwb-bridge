@@ -236,9 +236,8 @@ impl InputSink for CgInput {
         event.post(CGEventTapLocation::HID);
     }
 
-    /// Same PIXEL-unit smoothing as `scroll_vertical`. Sign not yet
-    /// independently live-verified (only vertical scrolling was tested
-    /// 2026-09-22) — flip if it turns out backward too.
+    /// Same PIXEL-unit smoothing as `scroll_vertical`. Sign live-verified
+    /// 2026-09-29 (needed no flip, unlike vertical).
     fn scroll_horizontal(&mut self, value: f64) {
         let pixels = (value * PIXELS_PER_SCROLL_UNIT).round() as i32;
         let Ok(event) = CGEvent::new_scroll_event(self.source.clone(), ScrollEventUnit::PIXEL, 2, 0, pixels, 0) else {

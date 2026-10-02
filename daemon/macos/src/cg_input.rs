@@ -292,6 +292,10 @@ impl CgInput {
     }
 
     fn post_mouse(&self, event_type: CGEventType, button_field: Option<i64>, click_count: Option<i64>) {
+        self.post_mouse_with_delta(event_type, button_field, click_count, None);
+    }
+
+    fn post_mouse_with_delta(&self, event_type: CGEventType, button_field: Option<i64>, click_count: Option<i64>, delta: Option<(i64, i64)>) {
         let Ok(event) = CGEvent::new_mouse_event(self.source.clone(), event_type, self.pos, CGMouseButton::Left) else {
             eprintln!("(cg_input: failed to create mouse event)");
             return;
@@ -302,6 +306,10 @@ impl CgInput {
         }
         if let Some(n) = click_count {
             event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, n);
+        }
+        if let Some((dx, dy)) = delta {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx);
+            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy);
         }
         event.post(CGEventTapLocation::HID);
     }
@@ -333,14 +341,20 @@ impl InputSink for CgInput {
         let bounds = virtual_desktop_bounds();
         let fx = x as f64 / x_extent as f64;
         let fy = y as f64 / y_extent as f64;
+        let previous = self.pos;
         self.pos = CGPoint::new(bounds.origin.x + fx * bounds.size.width, bounds.origin.y + fy * bounds.size.height);
+        // The relative movement, which real mice report alongside the position. Apps that lock
+        // and hide the cursor (first-person games, Unity's mouse-look) read only this: without
+        // it a posted move looks like no movement at all. Live-reported 2026-10-02 (Adrift's
+        // mouse-look didn't turn).
+        let delta = ((self.pos.x - previous.x).round() as i64, (self.pos.y - previous.y).round() as i64);
         let (event_type, button_field) = match self.held_button {
             Some((CGEventType::LeftMouseDown, _)) => (CGEventType::LeftMouseDragged, None),
             Some((CGEventType::RightMouseDown, _)) => (CGEventType::RightMouseDragged, None),
             Some((CGEventType::OtherMouseDown, field)) => (CGEventType::OtherMouseDragged, field),
             _ => (CGEventType::MouseMoved, None),
         };
-        self.post_mouse(event_type, button_field, None);
+        self.post_mouse_with_delta(event_type, button_field, None, Some(delta));
     }
 
     /// Posts button down/up, tracking two bits of state real hardware click

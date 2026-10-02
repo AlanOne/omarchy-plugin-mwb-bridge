@@ -19,7 +19,7 @@ use core_graphics::event::{
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::{CGPoint, CGRect};
 
-use mwb_protocol::input_handling::{InputSink, ModifierState};
+use mwb_protocol::input_handling::{EdgeExit, InputSink, ModifierState, ScreenEdge};
 
 use crate::keycode_macos::evdev_to_cgkeycode;
 use crate::windows_keys::{self, Action, AppKind};
@@ -80,6 +80,21 @@ fn virtual_desktop_bounds() -> CGRect {
         max_y = max_y.max(b.origin.y + b.size.height);
     }
     CGRect::new(&CGPoint::new(min_x, min_y), &core_graphics::geometry::CGSize::new(max_x - min_x, max_y - min_y))
+}
+
+/// Whether the system cursor is showing. Games and other apps that capture
+/// the mouse for look controls hide it, and while they do the cursor must not
+/// leave for Windows at a screen edge. `CGCursorIsVisible` is deprecated, so
+/// it's looked up at runtime rather than linked: if it's ever gone, the
+/// cursor counts as visible (switching keeps working, just without this guard).
+fn cursor_visible() -> bool {
+    type CgCursorIsVisible = unsafe extern "C" fn() -> u32;
+    static FN: std::sync::OnceLock<Option<CgCursorIsVisible>> = std::sync::OnceLock::new();
+    let f = FN.get_or_init(|| unsafe {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, c"CGCursorIsVisible".as_ptr());
+        if sym.is_null() { None } else { Some(std::mem::transmute::<*mut libc::c_void, CgCursorIsVisible>(sym)) }
+    });
+    f.map(|f| unsafe { f() } != 0).unwrap_or(true)
 }
 
 pub struct CgInput {
@@ -355,6 +370,43 @@ impl InputSink for CgInput {
             _ => (CGEventType::MouseMoved, None),
         };
         self.post_mouse_with_delta(event_type, button_field, None, Some(delta));
+    }
+
+    /// Relative mode ("Move mouse relatively" in PowerToys): moves from where
+    /// the cursor actually is (an app may have warped or locked it), keeps it
+    /// on screen, and posts the raw delta for apps that read movement rather
+    /// than position. Reports an edge exit only while the cursor is visible,
+    /// so mouse-look in a game never hands control back to Windows.
+    fn move_relative(&mut self, dx: i32, dy: i32) -> Option<EdgeExit> {
+        let bounds = virtual_desktop_bounds();
+        let current = CGEvent::new(self.source.clone()).map(|e| e.location()).unwrap_or(self.pos);
+        let (min_x, min_y) = (bounds.origin.x, bounds.origin.y);
+        let (max_x, max_y) = (min_x + bounds.size.width - 1.0, min_y + bounds.size.height - 1.0);
+        let (tx, ty) = (current.x + dx as f64, current.y + dy as f64);
+
+        let exit = if !cursor_visible() {
+            None
+        } else if tx < min_x {
+            Some(EdgeExit { edge: ScreenEdge::Left, along: (ty - min_y) / bounds.size.height })
+        } else if tx > max_x {
+            Some(EdgeExit { edge: ScreenEdge::Right, along: (ty - min_y) / bounds.size.height })
+        } else if ty < min_y {
+            Some(EdgeExit { edge: ScreenEdge::Top, along: (tx - min_x) / bounds.size.width })
+        } else if ty > max_y {
+            Some(EdgeExit { edge: ScreenEdge::Bottom, along: (tx - min_x) / bounds.size.width })
+        } else {
+            None
+        };
+
+        self.pos = CGPoint::new(tx.clamp(min_x, max_x), ty.clamp(min_y, max_y));
+        let (event_type, button_field) = match self.held_button {
+            Some((CGEventType::LeftMouseDown, _)) => (CGEventType::LeftMouseDragged, None),
+            Some((CGEventType::RightMouseDown, _)) => (CGEventType::RightMouseDragged, None),
+            Some((CGEventType::OtherMouseDown, field)) => (CGEventType::OtherMouseDragged, field),
+            _ => (CGEventType::MouseMoved, None),
+        };
+        self.post_mouse_with_delta(event_type, button_field, None, Some((dx as i64, dy as i64)));
+        exit
     }
 
     /// Posts button down/up, tracking two bits of state real hardware click

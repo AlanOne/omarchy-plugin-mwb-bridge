@@ -31,6 +31,12 @@ pub const PACKAGE_TYPE_HANDSHAKE_ACK: u8 = 127;
 // the last beat and re-triggers a pull — no state it touches is shared
 // with Mouse/Keyboard forwarding. See PROTOCOL.md.
 pub const PACKAGE_TYPE_MACHINE_SWITCHED: u8 = 77;
+// Sent by a controlled machine in "Move mouse relatively" mode when its cursor
+// is pushed off the edge facing the controller: asks the controller to switch
+// to `WheelDelta` (the next machine's ID) with its cursor at X/Y (universal
+// 0..65535). Plain 32-byte package. PowerToys Common.SendNextMachine /
+// Receiver.cs's NextMachine case.
+pub const PACKAGE_TYPE_NEXT_MACHINE: u8 = 121;
 // Sent immediately before MachineSwitched in every *real* switch this repo
 // has captured live from Windows (Ctrl+Alt+F1-style) — presumably just a
 // cursor-visibility toggle for the switch UX, but included here to exactly
@@ -292,6 +298,21 @@ pub fn build_machine_switched(id: u32, src_id: u32, des_id: u32) -> [u8; PACKAGE
     pack_u32_le(&mut buf, 4, id);
     pack_u32_le(&mut buf, 8, src_id);
     pack_u32_le(&mut buf, 12, des_id);
+    buf
+}
+
+/// Builds a NextMachine package (Type=121) — see its constant doc comment.
+/// `des_id` is the controller we're asking, `next_machine` the machine to
+/// switch to (the controller itself, when handing control back).
+pub fn build_next_machine(id: u32, src_id: u32, des_id: u32, x: u32, y: u32, next_machine: u32) -> [u8; PACKAGE_SIZE] {
+    let mut buf = [0u8; PACKAGE_SIZE];
+    buf[0] = PACKAGE_TYPE_NEXT_MACHINE;
+    pack_u32_le(&mut buf, 4, id);
+    pack_u32_le(&mut buf, 8, src_id);
+    pack_u32_le(&mut buf, 12, des_id);
+    pack_u32_le(&mut buf, 16, x);
+    pack_u32_le(&mut buf, 20, y);
+    pack_u32_le(&mut buf, 24, next_machine);
     buf
 }
 

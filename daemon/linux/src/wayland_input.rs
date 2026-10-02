@@ -20,7 +20,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
-use mwb_protocol::input_handling::{InputSink, ModifierState};
+use mwb_protocol::input_handling::{EdgeExit, InputSink, ModifierState, ScreenEdge};
 
 // Standard XKB "us" layout modifier bit indices (Shift/Ctrl/Alt/Super) —
 // matches xkbcommon's default assignment for this layout. Not derived from
@@ -168,6 +168,35 @@ pub struct WaylandInput {
     state: AppState,
     pointer: ZwlrVirtualPointerV1,
     keyboard: ZwpVirtualKeyboardV1,
+    // Relative mode ("Move mouse relatively" in PowerToys): Wayland gives a
+    // client no way to read the cursor position, so we track it ourselves in
+    // the output layout's logical pixels and keep driving the pointer with
+    // absolute moves. `layout` is the bounding box of all monitors (from
+    // `hyprctl monitors -j`); None means it couldn't be read, and relative
+    // moves fall back to plain relative motion without edge switching.
+    layout: Option<(f64, f64)>,
+    rel_pos: (f64, f64),
+}
+
+/// Logical size of the whole monitor layout (bounding box), from Hyprland.
+fn hyprland_layout_size() -> Option<(f64, f64)> {
+    let out = std::process::Command::new("hyprctl").args(["monitors", "-j"]).output().ok()?;
+    let monitors: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for m in monitors.as_array()? {
+        let scale = m["scale"].as_f64().unwrap_or(1.0).max(0.1);
+        let (mut w, mut h) = (m["width"].as_f64()? / scale, m["height"].as_f64()? / scale);
+        // transform 1/3/5/7 are 90/270-degree rotations: width and height swap.
+        if m["transform"].as_i64().unwrap_or(0) % 2 == 1 {
+            std::mem::swap(&mut w, &mut h);
+        }
+        let (x, y) = (m["x"].as_f64()?, m["y"].as_f64()?);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
+    }
+    (max_x > min_x && max_y > min_y).then(|| (max_x - min_x, max_y - min_y))
 }
 
 impl WaylandInput {
@@ -207,7 +236,12 @@ impl WaylandInput {
         keyboard.keymap(1 /* XKB_V1 */, keymap_fd.as_fd(), keymap_size);
         event_queue.roundtrip(&mut state).unwrap();
 
-        Self { event_queue, state, pointer, keyboard }
+        let layout = hyprland_layout_size();
+        match layout {
+            Some((w, h)) => println!("[mouse] Output layout {w}x{h} (for relative mode)."),
+            None => println!("[mouse] Couldn't read the monitor layout from hyprctl; relative mode won't switch back at edges."),
+        }
+        Self { event_queue, state, pointer, keyboard, layout, rel_pos: (0.0, 0.0) }
     }
 
     fn flush(&mut self) {
@@ -217,6 +251,9 @@ impl WaylandInput {
     /// Absolute pointer move. `x`/`y` range 0..=x_extent/y_extent — pass MWB's
     /// own 0..=65535 values straight through, no rescaling needed.
     pub fn move_absolute(&mut self, x: u32, y: u32, x_extent: u32, y_extent: u32) {
+        if let Some((w, h)) = self.layout {
+            self.rel_pos = (x as f64 / x_extent as f64 * w, y as f64 / y_extent as f64 * h);
+        }
         self.pointer.motion_absolute(now_ms(), x, y, x_extent, y_extent);
         self.pointer.frame();
         self.flush();
@@ -274,6 +311,32 @@ impl WaylandInput {
 impl InputSink for WaylandInput {
     fn move_absolute(&mut self, x: u32, y: u32, x_extent: u32, y_extent: u32) {
         WaylandInput::move_absolute(self, x, y, x_extent, y_extent)
+    }
+
+    /// Moves our tracked position, reports an edge exit, and drives the pointer
+    /// there with an absolute move (see the `layout` field's comment).
+    fn move_relative(&mut self, dx: i32, dy: i32) -> Option<EdgeExit> {
+        let Some((w, h)) = self.layout else {
+            WaylandInput::move_relative(self, dx as f64, dy as f64);
+            return None;
+        };
+        let (tx, ty) = (self.rel_pos.0 + dx as f64, self.rel_pos.1 + dy as f64);
+        let exit = if tx < 0.0 {
+            Some(EdgeExit { edge: ScreenEdge::Left, along: ty / h })
+        } else if tx > w - 1.0 {
+            Some(EdgeExit { edge: ScreenEdge::Right, along: ty / h })
+        } else if ty < 0.0 {
+            Some(EdgeExit { edge: ScreenEdge::Top, along: tx / w })
+        } else if ty > h - 1.0 {
+            Some(EdgeExit { edge: ScreenEdge::Bottom, along: tx / w })
+        } else {
+            None
+        };
+        let pos = (tx.clamp(0.0, w - 1.0), ty.clamp(0.0, h - 1.0));
+        let (x, y) = ((pos.0 / w * 65535.0) as u32, (pos.1 / h * 65535.0) as u32);
+        WaylandInput::move_absolute(self, x, y, 65535, 65535);
+        self.rel_pos = pos;
+        exit
     }
 
     fn button(&mut self, button_code: u32, pressed: bool) {

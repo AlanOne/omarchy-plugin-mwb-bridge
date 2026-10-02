@@ -40,6 +40,13 @@ pub struct Config {
     // `windows_keys.rs`. Toggled from the menu bar; ignored on Linux.
     #[serde(default = "default_windows_keys")]
     pub windows_keys: bool,
+    // Which side of this machine's screen faces the Windows PC in MWB's
+    // layout ("left", "right", "top", "bottom"). Only used in PowerToys'
+    // "Move mouse relatively" mode, where this machine decides when the
+    // cursor leaves for Windows. Optional: learned from where the cursor
+    // enters when unset.
+    #[serde(default)]
+    pub windows_side: Option<String>,
 }
 
 fn default_xkb_layout() -> String {

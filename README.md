@@ -259,6 +259,19 @@ to Windows, but a real PowerToys install won't actually come fetch it — see
 code, not something narrowed further here) — only the first file of a
 multi-file selection is used, the rest silently ignored.
 
+## Relative mouse mode (games)
+
+In PowerToys' default mode Windows sends absolute cursor positions, so mouse-look in a game on the
+bridged machine stops as soon as the Windows-side cursor reaches the screen edge (it switches back).
+Turn on **Move mouse relatively** in PowerToys' Mouse Without Borders settings and both bridges
+handle it: Windows sends raw movement, and the bridge itself notices the cursor being pushed off the
+edge that faces Windows and hands control back (a `NextMachine` package). That edge is learned from
+where the cursor enters after a switch; set `"windows_side": "left"` (or right/top/bottom) in
+config.json to fix it instead. While an app hides the cursor (a game's mouse-look), the macOS bridge
+never switches back at an edge; free the cursor (usually Esc) or use MWB's switch hotkey.
+
+The setting applies to every machine Windows controls, so update both bridges before turning it on.
+
 ## Locking both machines
 
 Double-tapping Mouse Without Borders' own lock hotkey (in PowerToys'

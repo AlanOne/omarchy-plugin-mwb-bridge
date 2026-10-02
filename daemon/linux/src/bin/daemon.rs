@@ -65,7 +65,7 @@ fn set_socket_timeouts(stream: &TcpStream) {
 // `mwb_protocol::input_handling`, shared verbatim with the macOS daemon —
 // see that module's doc comment. `WaylandInput`'s `InputSink` impl (in
 // wayland_input.rs) is this platform's only actual divergence.
-use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, LLKHF_UP};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP};
 
 /// Shared state between the client connection's receive loop, the file-
 /// server listener (port 15100), and the local clipboard-watcher thread —
@@ -556,6 +556,7 @@ fn run_session(
     // see `mwb_protocol::input_handling::handle_keyboard`'s doc comment)
     // and modifier tracking both live in `KeyboardState` now.
     let mut kb_state = KeyboardState::new();
+    let mut mouse_state = MouseState::new(cfg.windows_side.as_deref().and_then(ScreenEdge::parse));
     let mut lock_combo = LockComboDetector::new();
     let mut hi_count = 0u64;
     let mut clipboard_buf: Vec<u8> = Vec::new();
@@ -657,7 +658,15 @@ fn run_session(
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(w) = wl.as_deref_mut() {
                     println!(">>> MOUSE x={x} y={y} wheel={wheel} flags=0x{flags:x}");
-                    handle_mouse(w, x, y, wheel, flags, cfg.scroll_speed);
+                    // Relative mode: the cursor was pushed off the edge facing
+                    // Windows, so ask Windows to take control back.
+                    if let Some(back) = handle_mouse(w, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed) {
+                        let windows_id = unpack_u32_le(&full, 8);
+                        let mut pkg = build_next_machine(next_clip_id, cfg.machine_id, windows_id, back.x, back.y, windows_id);
+                        next_clip_id = next_clip_id.wrapping_add(1);
+                        finalize_send_buf(&mut pkg, magic_number);
+                        stream.write_all(&cipher.encrypt(&mut write_chain, &pkg))?;
+                    }
                 }
             }
             PACKAGE_TYPE_KEYBOARD => {

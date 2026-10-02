@@ -1379,6 +1379,7 @@ dependencies = [
  "memfd",
  "mwb_protocol",
  "rand",
+ "serde_json",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-misc",

@@ -19,7 +19,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use mwb_protocol::config::{self, Config};
-use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, LLKHF_UP};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP};
 use mwb_protocol::mwb_protocol::*;
 use rand::RngExt;
 
@@ -96,6 +96,7 @@ fn run_session(
     println!("[client] Handshake sent, entering receive loop.");
 
     let mut kb_state = KeyboardState::new();
+    let mut mouse_state = MouseState::new(cfg.windows_side.as_deref().and_then(ScreenEdge::parse));
     let mut lock_combo = LockComboDetector::new();
     let mut hi_count = 0u64;
     let mut clipboard_buf: Vec<u8> = Vec::new();
@@ -192,7 +193,16 @@ fn run_session(
                 let wheel = unpack_u32_le(&full, 24);
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(cg) = cg.as_deref_mut() {
-                    handle_mouse(cg, x, y, wheel, flags, cfg.scroll_speed);
+                    // Relative mode: the cursor was pushed off the edge facing
+                    // Windows, so ask Windows to take control back.
+                    if let Some(back) = handle_mouse(cg, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed) {
+                        let windows_id = unpack_u32_le(&full, 8);
+                        let mut pkg = build_next_machine(next_clip_id, cfg.machine_id, windows_id, back.x, back.y, windows_id);
+                        next_clip_id = next_clip_id.wrapping_add(1);
+                        finalize_send_buf(&mut pkg, magic_number);
+                        let ct = cipher.encrypt(&mut write_chain, &pkg);
+                        stream.write_all(&ct)?;
+                    }
                 }
             }
             PACKAGE_TYPE_KEYBOARD => {

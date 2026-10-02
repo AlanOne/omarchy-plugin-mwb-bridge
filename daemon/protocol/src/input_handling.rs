@@ -38,6 +38,110 @@ pub const BTN_MIDDLE: u32 = 0x112;
 pub const BTN_SIDE: u32 = 0x113;
 pub const BTN_EXTRA: u32 = 0x114;
 
+// "Move mouse relatively" (a PowerToys MWB setting): Windows sends each move as
+// a delta instead of an absolute position, with both values pushed this far
+// from zero so the receiver can tell them apart (dx = X - 100000 for X > 0,
+// X + 100000 for X < 0; a zero delta arrives as +100000). Event.cs's
+// MOVE_MOUSE_RELATIVE in PowerToys' source.
+pub const MOVE_MOUSE_RELATIVE: i32 = 100_000;
+
+// In relative mode Windows stops checking screen edges for us: the receiving
+// machine has to notice the cursor being pushed off the edge that faces
+// Windows and send a NextMachine package back (Receiver.cs's relative branch
+// -> MoveToMyNeighbourIfNeeded -> SendNextMachine). These are the universal
+// (0..65535) coordinates the cursor reappears at on Windows: just inside the
+// edge facing this machine, like MWB's own JUMP_PIXELS offset.
+const SWITCH_BACK_INSET: u32 = 300;
+const SWITCH_BACK_MIN_INTERVAL: Duration = Duration::from_millis(300);
+// An absolute move this close to an edge (universal units, ~2%) right after a
+// switch is the entry point, and tells us which edge leads back to Windows.
+const ENTRY_EDGE_MARGIN: u32 = 1400;
+
+/// A side of this machine's screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScreenEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl ScreenEdge {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            "top" | "up" => Some(Self::Top),
+            "bottom" | "down" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+}
+
+/// A relative move that tried to carry the cursor past a screen edge.
+/// `along` is the cursor's position along that edge, 0..=1 (top-to-bottom for
+/// Left/Right, left-to-right for Top/Bottom).
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeExit {
+    pub edge: ScreenEdge,
+    pub along: f64,
+}
+
+/// Where Windows should put its cursor when control switches back to it
+/// (universal 0..65535 coordinates): the payload of a NextMachine package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchBack {
+    pub x: u32,
+    pub y: u32,
+}
+
+/// Per-connection mouse state for relative mode: which edge leads back to
+/// Windows (configured, or learned from where the cursor enters), and when we
+/// last asked to switch back.
+pub struct MouseState {
+    configured_edge: Option<ScreenEdge>,
+    learned_edge: Option<ScreenEdge>,
+    relative_seen: bool,
+    last_packet: Option<Instant>,
+    last_switch_back: Option<Instant>,
+}
+
+impl MouseState {
+    /// `configured_edge`: config.json's `windows_side`, if set; otherwise it's
+    /// learned from the first switch into this machine.
+    pub fn new(configured_edge: Option<ScreenEdge>) -> Self {
+        Self { configured_edge, learned_edge: None, relative_seen: false, last_packet: None, last_switch_back: None }
+    }
+
+    pub fn windows_edge(&self) -> Option<ScreenEdge> {
+        self.configured_edge.or(self.learned_edge)
+    }
+
+    /// An absolute move arriving as the entry point of a switch (any absolute
+    /// move once relative mode is in use, or the first move after a pause),
+    /// close enough to an edge to say which side Windows is on.
+    fn learn_entry(&mut self, x: u32, y: u32, after_pause: bool) {
+        if !(self.relative_seen || after_pause) {
+            return;
+        }
+        let edge = if x <= ENTRY_EDGE_MARGIN {
+            Some(ScreenEdge::Left)
+        } else if x >= 65535 - ENTRY_EDGE_MARGIN {
+            Some(ScreenEdge::Right)
+        } else if y <= ENTRY_EDGE_MARGIN {
+            Some(ScreenEdge::Top)
+        } else if y >= 65535 - ENTRY_EDGE_MARGIN {
+            Some(ScreenEdge::Bottom)
+        } else {
+            None
+        };
+        if edge.is_some() && edge != self.learned_edge {
+            self.learned_edge = edge;
+            println!("[mouse] Windows is on the {:?} side (learned from where the cursor entered).", edge.unwrap());
+        }
+    }
+}
+
 // LLKHF_UP: bit 7 of a low-level-keyboard-hook's flags marks a key-up event.
 pub const LLKHF_UP: u32 = 0x80;
 
@@ -88,6 +192,12 @@ pub struct ModifierState {
 /// responsible for its own final translation to native calls.
 pub trait InputSink {
     fn move_absolute(&mut self, x: u32, y: u32, x_extent: u32, y_extent: u32);
+    /// Moves the cursor by (dx, dy) pixels (relative mode), keeping it on
+    /// screen. Returns where it was pushed past an edge, if it was, so the
+    /// caller can hand control back to Windows. An impl may return `None`
+    /// while switching away would be wrong (e.g. an app has captured the
+    /// cursor for mouse-look).
+    fn move_relative(&mut self, dx: i32, dy: i32) -> Option<EdgeExit>;
     fn button(&mut self, button_code: u32, pressed: bool);
     fn scroll_vertical(&mut self, value: f64);
     fn scroll_horizontal(&mut self, value: f64);
@@ -189,8 +299,39 @@ impl Default for LockComboDetector {
 }
 
 /// Decodes one Mouse packet's raw (m1, m2, m3, dwFlags) into calls on `sink`.
-pub fn handle_mouse(sink: &mut impl InputSink, m1: u32, m2: u32, m3: u32, flags: u32, scroll_speed: f64) {
+/// Returns `Some` when a relative move pushed the cursor off the edge facing
+/// Windows: the caller sends Windows a NextMachine package with it.
+pub fn handle_mouse(sink: &mut impl InputSink, state: &mut MouseState, m1: u32, m2: u32, m3: u32, flags: u32, scroll_speed: f64) -> Option<SwitchBack> {
+    let now = Instant::now();
+    let after_pause = state.last_packet.is_none_or(|t| now.duration_since(t) > Duration::from_secs(1));
+    state.last_packet = Some(now);
+
+    let (xi, yi) = (m1 as i32, m2 as i32);
+    let relative = xi.abs() >= MOVE_MOUSE_RELATIVE && yi.abs() >= MOVE_MOUSE_RELATIVE;
+    if relative {
+        state.relative_seen = true;
+    }
+
     match flags {
+        WM_MOUSEMOVE if relative => {
+            let decode = |v: i32| if v < 0 { v + MOVE_MOUSE_RELATIVE } else { v - MOVE_MOUSE_RELATIVE };
+            let exit = sink.move_relative(decode(xi), decode(yi))?;
+            if Some(exit.edge) != state.windows_edge() {
+                return None;
+            }
+            if state.last_switch_back.is_some_and(|t| now.duration_since(t) < SWITCH_BACK_MIN_INTERVAL) {
+                return None;
+            }
+            state.last_switch_back = Some(now);
+            let along = (exit.along.clamp(0.0, 1.0) * 65535.0) as u32;
+            // Reappear on Windows just inside its edge that faces us.
+            return Some(match exit.edge {
+                ScreenEdge::Left => SwitchBack { x: 65535 - SWITCH_BACK_INSET, y: along },
+                ScreenEdge::Right => SwitchBack { x: SWITCH_BACK_INSET, y: along },
+                ScreenEdge::Top => SwitchBack { x: along, y: 65535 - SWITCH_BACK_INSET },
+                ScreenEdge::Bottom => SwitchBack { x: along, y: SWITCH_BACK_INSET },
+            });
+        }
         WM_MOUSEMOVE => {
             // Observed in real traffic (likely an edge-crossing overshoot):
             // an occasional out-of-range value that's actually small and
@@ -198,8 +339,9 @@ pub fn handle_mouse(sink: &mut impl InputSink, m1: u32, m2: u32, m3: u32, flags:
             // i32) when read as one. Clamp back into the valid 0..=65535
             // absolute-coordinate range rather than forwarding it verbatim,
             // which would otherwise send the cursor somewhere nonsensical.
-            let x = (m1 as i32).clamp(0, 65535) as u32;
-            let y = (m2 as i32).clamp(0, 65535) as u32;
+            let x = xi.clamp(0, 65535) as u32;
+            let y = yi.clamp(0, 65535) as u32;
+            state.learn_entry(x, y, after_pause);
             sink.move_absolute(x, y, 65535, 65535)
         }
         WM_LBUTTONDOWN => sink.button(BTN_LEFT, true),
@@ -234,6 +376,7 @@ pub fn handle_mouse(sink: &mut impl InputSink, m1: u32, m2: u32, m3: u32, flags:
         WM_XBUTTONUP => sink.button(if m3 == 2 { BTN_EXTRA } else { BTN_SIDE }, false),
         _ => {}
     }
+    None
 }
 
 /// Per-connection keyboard-handling state (`handle_keyboard` needs both
@@ -302,4 +445,88 @@ pub fn handle_keyboard(sink: &mut impl InputSink, state: &mut KeyboardState, vk:
         state.pressed_keys.remove(&evdev_code);
     }
     sink.key(evdev_code, pressed);
+}
+
+#[cfg(test)]
+mod relative_mode_tests {
+    use super::*;
+
+    /// Records calls; `exit` is what the next move_relative reports.
+    #[derive(Default)]
+    struct FakeSink {
+        relative: Vec<(i32, i32)>,
+        absolute: Vec<(u32, u32)>,
+        exit: Option<EdgeExit>,
+    }
+
+    impl InputSink for FakeSink {
+        fn move_absolute(&mut self, x: u32, y: u32, _: u32, _: u32) { self.absolute.push((x, y)); }
+        fn move_relative(&mut self, dx: i32, dy: i32) -> Option<EdgeExit> {
+            self.relative.push((dx, dy));
+            self.exit.take()
+        }
+        fn button(&mut self, _: u32, _: bool) {}
+        fn scroll_vertical(&mut self, _: f64) {}
+        fn scroll_horizontal(&mut self, _: f64) {}
+        fn key(&mut self, _: u32, _: bool) {}
+        fn modifiers(&mut self, _: ModifierState, _: bool) {}
+    }
+
+    fn rel(v: i32) -> u32 {
+        (if v < 0 { v - MOVE_MOUSE_RELATIVE } else { v + MOVE_MOUSE_RELATIVE }) as u32
+    }
+
+    #[test]
+    fn decodes_relative_deltas_including_zero_and_negative() {
+        let (mut sink, mut st) = (FakeSink::default(), MouseState::new(None));
+        handle_mouse(&mut sink, &mut st, rel(5), rel(-3), 0, WM_MOUSEMOVE, 1.0);
+        handle_mouse(&mut sink, &mut st, rel(0), rel(0), 0, WM_MOUSEMOVE, 1.0);
+        assert_eq!(sink.relative, vec![(5, -3), (0, 0)]);
+        assert!(sink.absolute.is_empty());
+    }
+
+    #[test]
+    fn absolute_moves_still_work() {
+        let (mut sink, mut st) = (FakeSink::default(), MouseState::new(None));
+        handle_mouse(&mut sink, &mut st, 30000, 20000, 0, WM_MOUSEMOVE, 1.0);
+        assert_eq!(sink.absolute, vec![(30000, 20000)]);
+    }
+
+    #[test]
+    fn learns_windows_side_from_entry_and_switches_back_there_only() {
+        let (mut sink, mut st) = (FakeSink::default(), MouseState::new(None));
+        assert_eq!(st.windows_edge(), None);
+        // Entry right at the left edge after a pause: Windows is to the left.
+        handle_mouse(&mut sink, &mut st, 200, 30000, 0, WM_MOUSEMOVE, 1.0);
+        assert_eq!(st.windows_edge(), Some(ScreenEdge::Left));
+
+        // Pushing off the right edge does nothing...
+        sink.exit = Some(EdgeExit { edge: ScreenEdge::Right, along: 0.5 });
+        assert_eq!(handle_mouse(&mut sink, &mut st, rel(9), rel(0), 0, WM_MOUSEMOVE, 1.0), None);
+        // ...pushing off the left edge hands control back, reappearing at Windows' right edge.
+        sink.exit = Some(EdgeExit { edge: ScreenEdge::Left, along: 0.25 });
+        let back = handle_mouse(&mut sink, &mut st, rel(-9), rel(0), 0, WM_MOUSEMOVE, 1.0).expect("switch back");
+        assert_eq!(back, SwitchBack { x: 65535 - SWITCH_BACK_INSET, y: (0.25 * 65535.0) as u32 });
+        // A second push right away is throttled.
+        sink.exit = Some(EdgeExit { edge: ScreenEdge::Left, along: 0.25 });
+        assert_eq!(handle_mouse(&mut sink, &mut st, rel(-9), rel(0), 0, WM_MOUSEMOVE, 1.0), None);
+    }
+
+    #[test]
+    fn configured_side_wins_and_mid_screen_entry_teaches_nothing() {
+        let (mut sink, mut st) = (FakeSink::default(), MouseState::new(ScreenEdge::parse("right")));
+        handle_mouse(&mut sink, &mut st, 200, 30000, 0, WM_MOUSEMOVE, 1.0);
+        assert_eq!(st.windows_edge(), Some(ScreenEdge::Right));
+
+        let mut st2 = MouseState::new(None);
+        handle_mouse(&mut sink, &mut st2, 30000, 30000, 0, WM_MOUSEMOVE, 1.0);
+        assert_eq!(st2.windows_edge(), None);
+    }
+
+    #[test]
+    fn clicks_in_relative_mode_are_not_moves() {
+        let (mut sink, mut st) = (FakeSink::default(), MouseState::new(None));
+        handle_mouse(&mut sink, &mut st, rel(0), rel(0), 0, WM_LBUTTONDOWN, 1.0);
+        assert!(sink.relative.is_empty() && sink.absolute.is_empty());
+    }
 }

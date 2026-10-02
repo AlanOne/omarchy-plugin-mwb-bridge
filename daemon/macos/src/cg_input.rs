@@ -115,6 +115,10 @@ pub struct CgInput {
     rewritten: HashMap<u32, Rewritten>,
     app_switch_open: bool,
     win_tapped: bool,
+    // Windows sends AltGr as a fake Left Ctrl press right before Right Alt.
+    // That Ctrl is released again as soon as Right Alt arrives (see
+    // `modifier_key`), and its own release later is dropped.
+    altgr_ctrl_cancelled: bool,
 }
 
 impl CgInput {
@@ -139,6 +143,7 @@ impl CgInput {
             rewritten: HashMap::new(),
             app_switch_open: false,
             win_tapped: false,
+            altgr_ctrl_cancelled: false,
         }
     }
 
@@ -187,6 +192,18 @@ impl CgInput {
         if state.alt || state.level3 {
             flags |= CGEventFlags::CGEventFlagAlternate;
         }
+        // Which Option is held, in the device-dependent low bits real
+        // keyboards set (NX_DEVICELALTKEYMASK / NX_DEVICERALTKEYMASK). Apps
+        // that treat the two differently need them: Ghostty's
+        // `macos-option-as-alt = left` makes Left Option a terminal Alt and
+        // leaves Right Option (AltGr) typing characters, but without these
+        // bits it can't tell which one is down.
+        if state.alt {
+            flags |= CGEventFlags::from_bits_retain(0x20);
+        }
+        if state.level3 {
+            flags |= CGEventFlags::from_bits_retain(0x40);
+        }
         if state.super_ {
             flags |= if swap && self.win_as_control {
                 CGEventFlags::CGEventFlagControl
@@ -200,6 +217,21 @@ impl CgInput {
     fn modifier_key(&mut self, evdev: u32, pressed: bool) {
         let is_win = matches!(evdev, windows_keys::EV_LEFTMETA | windows_keys::EV_RIGHTMETA);
         let is_alt = evdev == windows_keys::EV_LEFTALT;
+
+        // AltGr: release the fake Left Ctrl Windows pressed just before it.
+        // Left held, the Mac sees Control (or Command, with Windows-style
+        // keys) + Option, and AltGr+V types nothing instead of @. The shared
+        // modifier tracking already drops it from the flags, but the key
+        // itself was already posted as held down.
+        if pressed && evdev == windows_keys::EV_RIGHTALT {
+            if let Some(ctrl_keycode) = self.posted_modifiers.remove(&windows_keys::EV_LEFTCTRL) {
+                self.post_key(ctrl_keycode, false, self.flags, CGEventTapLocation::HID, false);
+                self.altgr_ctrl_cancelled = true;
+            }
+        }
+        if !pressed && evdev == windows_keys::EV_LEFTCTRL && std::mem::take(&mut self.altgr_ctrl_cancelled) {
+            return;
+        }
         let keycode = if pressed {
             let kc = self.modifier_keycode(evdev);
             if let Some(kc) = kc {

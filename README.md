@@ -216,6 +216,8 @@ Pick it in System Settings > Keyboard > Text Input > Edit > + (under
 Slovenian or Others; log out and back in if it isn't listed), and remove
 Apple's Slovenian. AltGr is Right Alt as on Windows; Left Alt types the same
 characters, since a Mac layout can't tell the two Option keys apart.
+Terminals that turn Option into Alt need that limited to the left key, or
+AltGr can't type anything there: in Ghostty, `macos-option-as-alt = left`.
 
 **Windows-style keys** (menu bar toggle, on by default): Ctrl and Win swap
 so Ctrl+C/V/Z/... work as on Windows, except in terminals, where Ctrl stays a

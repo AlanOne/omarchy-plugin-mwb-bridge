@@ -12,5 +12,7 @@ tray-icon = "0.19"
 muda = "0.15"
 tao = "0.30"
 arboard = "3"
+libc = "0.2"
+serde_json = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

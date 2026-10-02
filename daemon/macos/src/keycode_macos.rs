@@ -125,7 +125,12 @@ pub fn evdev_to_cgkeycode(evdev: u32) -> Option<u16> {
         51 => 0x2B, // , <
         12 => 0x1B, // - _
         52 => 0x2F, // . >
-        41 => 0x32, // ` ~
+        41 => 0x32, // ` ~ (the key left of 1)
+        // KEY_102ND, the extra ISO key next to left Shift -> kVK_ISO_Section.
+        // Which character each of these two produces is whatever the active
+        // input source says; the bundled "Slovenian (Windows)" layout (see
+        // packaging/keylayout/) is built against exactly these two codes.
+        86 => 0x0A,
         26 => 0x21, // [ {
         43 => 0x2A, // \ |
         27 => 0x1E, // ] }

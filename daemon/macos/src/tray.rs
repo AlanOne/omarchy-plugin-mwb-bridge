@@ -6,13 +6,16 @@
 // how small this first cut is meant to be.
 
 use std::process::Command;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use mwb_protocol::config;
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+
+use crate::windows_keys;
 use tray_icon::{Icon, TrayIconBuilder};
 
 /// A double-headed arrow (↔) — a simple, unambiguous "bridges two machines"
@@ -81,6 +84,25 @@ fn open_config() {
     let _ = Command::new("open").arg("-t").arg(path).spawn();
 }
 
+/// Saves the Windows-style keys toggle into config.json, keeping every other
+/// field (and any the user added by hand) exactly as it was.
+fn save_windows_keys(enabled: bool) {
+    let path = config::config_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        eprintln!("(tray: config.json didn't parse, not saving the Windows-style keys toggle)");
+        return;
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("windows_keys".to_string(), serde_json::Value::Bool(enabled));
+    }
+    if let Ok(body) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(&path, body + "\n");
+    }
+}
+
 fn restart_app() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = Command::new(exe).spawn();
@@ -100,10 +122,18 @@ pub fn run() {
 
     let menu = Menu::new();
     let status_item = MenuItem::new(status_line(), false, None);
+    // The network thread loads the saved setting into ENABLED at startup;
+    // read the config directly here so the checkmark is right even before
+    // that has happened.
+    let windows_keys_on = config::load_config().map(|c| c.windows_keys).unwrap_or(true);
+    windows_keys::ENABLED.store(windows_keys_on, Ordering::Relaxed);
+    let windows_keys_item = CheckMenuItem::new("Windows-Style Keys", true, windows_keys_on, None);
     let edit_config_item = MenuItem::new("Edit Config...", true, None);
     let restart_item = MenuItem::new("Restart App", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&status_item).unwrap();
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
+    menu.append(&windows_keys_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&edit_config_item).unwrap();
     menu.append(&restart_item).unwrap();
@@ -119,6 +149,7 @@ pub fn run() {
         .expect("failed to create the menu bar status item");
 
     let menu_channel = MenuEvent::receiver();
+    let windows_keys_id = windows_keys_item.id().clone();
     let edit_config_id = edit_config_item.id().clone();
     let restart_id = restart_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -131,7 +162,11 @@ pub fn run() {
         }
 
         if let Ok(event) = menu_channel.try_recv() {
-            if event.id == edit_config_id {
+            if event.id == windows_keys_id {
+                let on = windows_keys_item.is_checked();
+                windows_keys::ENABLED.store(on, Ordering::Relaxed);
+                save_windows_keys(on);
+            } else if event.id == edit_config_id {
                 open_config();
             } else if event.id == restart_id {
                 restart_app();

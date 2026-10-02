@@ -1362,9 +1362,11 @@ dependencies = [
  "core-graphics",
  "flate2",
  "image",
+ "libc",
  "muda",
  "mwb_protocol",
  "rand",
+ "serde_json",
  "tao",
  "tray-icon",
 ]

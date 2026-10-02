@@ -9,6 +9,7 @@
 // first, same category of "convincing false positive" the MWB Windows-side
 // toasts turned out to be on the Linux build.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use core_graphics::display::CGDisplay;
@@ -21,6 +22,12 @@ use core_graphics::geometry::{CGPoint, CGRect};
 use mwb_protocol::input_handling::{InputSink, ModifierState};
 
 use crate::keycode_macos::evdev_to_cgkeycode;
+use crate::windows_keys::{self, Action, AppKind};
+
+/// What a non-modifier key's press was turned into, so its repeats and its
+/// release go out as the same key. `None` means the press was consumed
+/// (e.g. Win+E opened Finder) and the release is dropped too.
+type Rewritten = Option<(u16, CGEventFlags, CGEventTapLocation)>;
 
 // Real MWB/CGEventPost mouse-button index convention: 0=left, 1=right,
 // 2=center/middle, and (matching the de facto standard most apps/browsers
@@ -97,6 +104,17 @@ pub struct CgInput {
     last_click_time: Instant,
     last_click_pos: CGPoint,
     click_count: i64,
+    // Windows-style keys (see `windows_keys.rs`). `mods` is the Windows
+    // keyboard's own modifier state; whether Ctrl/Win are swapped is decided
+    // when each goes down (terminals keep a real Ctrl), and remembered per
+    // posted modifier key so its release always matches its press.
+    mods: ModifierState,
+    ctrl_as_command: bool,
+    win_as_control: bool,
+    posted_modifiers: HashMap<u32, u16>,
+    rewritten: HashMap<u32, Rewritten>,
+    app_switch_open: bool,
+    win_tapped: bool,
 }
 
 impl CgInput {
@@ -114,6 +132,130 @@ impl CgInput {
             last_click_time: Instant::now(),
             last_click_pos: pos,
             click_count: 1,
+            mods: ModifierState::default(),
+            ctrl_as_command: true,
+            win_as_control: true,
+            posted_modifiers: HashMap::new(),
+            rewritten: HashMap::new(),
+            app_switch_open: false,
+            win_tapped: false,
+        }
+    }
+
+    fn post_key(&self, keycode: u16, pressed: bool, flags: CGEventFlags, location: CGEventTapLocation, repeat: bool) {
+        let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, pressed) else {
+            eprintln!("(cg_input: failed to create keyboard event)");
+            return;
+        };
+        if repeat {
+            event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
+        }
+        event.set_flags(flags);
+        event.post(location);
+    }
+
+    fn modifier_keycode(&self, evdev: u32) -> Option<u16> {
+        if windows_keys::enabled() {
+            match evdev {
+                windows_keys::EV_LEFTCTRL if self.ctrl_as_command => return Some(windows_keys::VK_COMMAND),
+                windows_keys::EV_RIGHTCTRL if self.ctrl_as_command => return Some(windows_keys::VK_RIGHT_COMMAND),
+                windows_keys::EV_LEFTMETA if self.win_as_control => return Some(windows_keys::VK_CONTROL),
+                windows_keys::EV_RIGHTMETA if self.win_as_control => return Some(windows_keys::VK_RIGHT_CONTROL),
+                _ => {}
+            }
+        }
+        evdev_to_cgkeycode(evdev)
+    }
+
+    fn flags_for(&self, state: ModifierState) -> CGEventFlags {
+        let swap = windows_keys::enabled();
+        let mut flags = CGEventFlags::CGEventFlagNull;
+        if state.shift {
+            flags |= CGEventFlags::CGEventFlagShift;
+        }
+        if state.ctrl {
+            flags |= if swap && self.ctrl_as_command {
+                CGEventFlags::CGEventFlagCommand
+            } else {
+                CGEventFlags::CGEventFlagControl
+            };
+        }
+        // Alt and AltGr both fold into Option: there's no separate "Level 3
+        // shift" flag on macOS — AltGr-equivalent characters come from the
+        // input source's own Option-key tables once CGEventFlagAlternate is
+        // set, so level3 doesn't need its own bit the way Linux/XKB's Mod5 did.
+        if state.alt || state.level3 {
+            flags |= CGEventFlags::CGEventFlagAlternate;
+        }
+        if state.super_ {
+            flags |= if swap && self.win_as_control {
+                CGEventFlags::CGEventFlagControl
+            } else {
+                CGEventFlags::CGEventFlagCommand
+            };
+        }
+        flags
+    }
+
+    fn modifier_key(&mut self, evdev: u32, pressed: bool) {
+        let is_win = matches!(evdev, windows_keys::EV_LEFTMETA | windows_keys::EV_RIGHTMETA);
+        let is_alt = evdev == windows_keys::EV_LEFTALT;
+        let keycode = if pressed {
+            let kc = self.modifier_keycode(evdev);
+            if let Some(kc) = kc {
+                self.posted_modifiers.insert(evdev, kc);
+            }
+            kc
+        } else {
+            self.posted_modifiers.remove(&evdev).or_else(|| self.modifier_keycode(evdev))
+        };
+        if pressed {
+            self.win_tapped = is_win;
+        }
+        // Alt let go: close the Command+Tab switcher on the app it's showing.
+        if !pressed && is_alt && self.app_switch_open {
+            self.app_switch_open = false;
+            self.post_key(windows_keys::VK_COMMAND, false, self.flags, CGEventTapLocation::Session, false);
+        }
+        let Some(keycode) = keycode else {
+            eprintln!("(cg_input: no CGKeyCode mapping for evdev code {evdev}, ignoring)");
+            return;
+        };
+        self.post_key(keycode, pressed, self.flags, CGEventTapLocation::HID, false);
+        // A Win tap on its own, like the Windows Start menu, opens Spotlight.
+        if !pressed && is_win && std::mem::take(&mut self.win_tapped) && windows_keys::enabled() {
+            self.post_key(windows_keys::VK_SPACE, true, CGEventFlags::CGEventFlagCommand, CGEventTapLocation::Session, false);
+            self.post_key(windows_keys::VK_SPACE, false, CGEventFlags::CGEventFlagCommand, CGEventTapLocation::Session, false);
+        }
+    }
+
+    /// What this press should turn into under Windows-style keys, or `None`
+    /// to forward it unchanged.
+    fn windows_rewrite(&mut self, evdev: u32) -> Option<Rewritten> {
+        if !windows_keys::enabled() || !windows_keys::needs_context(evdev, self.mods) {
+            return None;
+        }
+        let app = windows_keys::focused_app();
+        match windows_keys::rewrite(evdev, self.mods, app, &mut windows_keys::focus_is_text) {
+            Action::Raw => None,
+            Action::Key(kc, flags) => Some(Some((kc, flags, CGEventTapLocation::HID))),
+            Action::SystemShortcut(kc, flags) => Some(Some((kc, flags, CGEventTapLocation::Session))),
+            Action::AppSwitch { reverse } => {
+                if !self.app_switch_open {
+                    self.app_switch_open = true;
+                    self.post_key(windows_keys::VK_COMMAND, true, CGEventFlags::CGEventFlagCommand, CGEventTapLocation::Session, false);
+                }
+                let mut flags = CGEventFlags::CGEventFlagCommand;
+                if reverse {
+                    flags |= CGEventFlags::CGEventFlagShift;
+                }
+                Some(Some((windows_keys::VK_TAB, flags, CGEventTapLocation::Session)))
+            }
+            Action::OpenFinderWindow => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+                let _ = std::process::Command::new("open").arg(home).spawn();
+                Some(None)
+            }
         }
     }
 
@@ -248,34 +390,47 @@ impl InputSink for CgInput {
     }
 
     fn key(&mut self, evdev_code: u32, pressed: bool) {
+        if windows_keys::is_modifier(evdev_code) {
+            self.modifier_key(evdev_code, pressed);
+            return;
+        }
+        if pressed {
+            self.win_tapped = false;
+            if let Some(rewritten) = self.windows_rewrite(evdev_code) {
+                if let Some((kc, flags, location)) = rewritten {
+                    self.post_key(kc, true, flags, location, false);
+                }
+                self.rewritten.insert(evdev_code, rewritten);
+                return;
+            }
+        } else if let Some(rewritten) = self.rewritten.remove(&evdev_code) {
+            if let Some((kc, flags, location)) = rewritten {
+                self.post_key(kc, false, flags, location, false);
+            }
+            return;
+        }
         let Some(keycode) = evdev_to_cgkeycode(evdev_code) else {
             eprintln!("(cg_input: no CGKeyCode mapping for evdev code {evdev_code}, ignoring)");
             return;
         };
-        let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, pressed) else {
-            eprintln!("(cg_input: failed to create keyboard event)");
-            return;
-        };
-        event.set_flags(self.flags);
-        event.post(CGEventTapLocation::HID);
+        self.post_key(keycode, pressed, self.flags, CGEventTapLocation::HID, false);
     }
 
     /// Forwards one of Windows' auto-repeat key-downs as a key-down with the
     /// autorepeat field set — what a real Mac keyboard's repeats look like
     /// to apps (some treat a repeat differently from a fresh press). Repeat
     /// delay/rate therefore follow the Windows machine's keyboard settings,
-    /// not this Mac's.
+    /// not this Mac's. A rewritten key repeats as what it was rewritten to.
     fn key_repeat(&mut self, evdev_code: u32) {
-        let Some(keycode) = evdev_to_cgkeycode(evdev_code) else {
-            return;
-        };
-        let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, true) else {
-            eprintln!("(cg_input: failed to create keyboard event)");
-            return;
-        };
-        event.set_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT, 1);
-        event.set_flags(self.flags);
-        event.post(CGEventTapLocation::HID);
+        match self.rewritten.get(&evdev_code) {
+            Some(Some((kc, flags, location))) => self.post_key(*kc, true, *flags, *location, true),
+            Some(None) => {}
+            None => {
+                if let Some(keycode) = evdev_to_cgkeycode(evdev_code) {
+                    self.post_key(keycode, true, self.flags, CGEventTapLocation::HID, true);
+                }
+            }
+        }
     }
 
     /// Converts the generic `ModifierState` into `CGEventFlags`, stored and
@@ -285,29 +440,21 @@ impl InputSink for CgInput {
     /// field). `numlock` is ignored: unlike Linux/XKB, Mac keypads have no
     /// NumLock lock-state to desync in the first place — numpad CGKeyCodes
     /// always produce digits regardless of any flag.
+    ///
+    /// With Windows-style keys on, this is also where Ctrl/Win decide whether
+    /// they swap: at the moment each goes down, based on whether a terminal
+    /// has focus.
     fn modifiers(&mut self, state: ModifierState, _numlock: bool) {
-        let mut flags = CGEventFlags::CGEventFlagNull;
-        if state.shift {
-            flags |= CGEventFlags::CGEventFlagShift;
+        if windows_keys::enabled() {
+            if state.ctrl && !self.mods.ctrl {
+                self.ctrl_as_command = windows_keys::focused_app() != AppKind::Terminal;
+            }
+            if state.super_ && !self.mods.super_ {
+                self.win_as_control = windows_keys::focused_app() != AppKind::Terminal;
+            }
         }
-        if state.ctrl {
-            flags |= CGEventFlags::CGEventFlagControl;
-        }
-        if state.alt {
-            flags |= CGEventFlags::CGEventFlagAlternate;
-        }
-        if state.super_ {
-            flags |= CGEventFlags::CGEventFlagCommand;
-        }
-        // No separate "Level 3 shift" flag on macOS — AltGr-equivalent
-        // characters are produced by the input source's own Option-key
-        // dead-key/special-character tables once CGEventFlagAlternate is
-        // set, so level3 folds into the same Alternate flag here rather
-        // than needing its own bit the way Linux/XKB's Mod5 did.
-        if state.level3 {
-            flags |= CGEventFlags::CGEventFlagAlternate;
-        }
-        self.flags = flags;
+        self.mods = state;
+        self.flags = self.flags_for(state);
     }
 }
 

@@ -81,7 +81,11 @@ pub fn vk_to_evdev(vk: u32) -> Option<u32> {
         0xBA => 39, // VK_OEM_1 ; :
         0xBB => 13, // VK_OEM_PLUS = +
         0xBC => 51, // VK_OEM_COMMA , <
-        0xBD => 12, // VK_OEM_MINUS - _
+        // VK_OEM_MINUS: on the Slovenian Windows layout this is the "- _" key
+        // at the US "/" position (scancode 0x35 in kbdcr.dll's own tables),
+        // not the US "-" position (that key is VK_OEM_2 on Slovenian, below).
+        // Mapping it to 12 as on a US layout made "-" type the apostrophe key.
+        0xBD => 53,
         0xBE => 52, // VK_OEM_PERIOD . >
         // VK_OEM_2: on this user's Slovenian Windows layout, the driver
         // assigns this VK to the physical key that produces apostrophe
@@ -95,6 +99,9 @@ pub fn vk_to_evdev(vk: u32) -> Option<u32> {
         0xDC => 43, // VK_OEM_5 \ |
         0xDD => 27, // VK_OEM_6 ] }
         0xDE => 40, // VK_OEM_7 ' "
+        // VK_OEM_102: the extra ISO key next to left Shift ("< >" on
+        // Slovenian). Previously unmapped, so it typed nothing.
+        0xE2 => 86,
 
         _ => return None,
     })

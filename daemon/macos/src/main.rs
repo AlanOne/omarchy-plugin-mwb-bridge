@@ -11,6 +11,7 @@
 mod cg_input;
 mod clipboard;
 mod keycode_macos;
+mod windows_keys;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -303,6 +304,7 @@ fn run_server_listener(cfg: Config) {
 }
 
 fn network_thread(cfg: Config) {
+    windows_keys::ENABLED.store(cfg.windows_keys, std::sync::atomic::Ordering::Relaxed);
     {
         let cfg = cfg.clone();
         std::thread::spawn(move || run_server_listener(cfg));

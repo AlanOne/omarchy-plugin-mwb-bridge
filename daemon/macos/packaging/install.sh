@@ -76,6 +76,14 @@ EXECUTABLE_PATH="$APP_DIR/Contents/MacOS/mwb_mac_bridge"
 sed -e "s|__EXECUTABLE_PATH__|$EXECUTABLE_PATH|" -e "s|__LOG_DIR__|$LOG_DIR|" \
     "$SCRIPT_DIR/com.alanone.mwb-mac-bridge.plist.template" > "$PLIST_PATH"
 
+# The Windows Slovenian keyboard layout, so the Windows keyboard types the
+# same characters here as on Windows (Apple's own "Slovenian" layout is a
+# different layout). Selecting it is a one-time step in System Settings >
+# Keyboard > Text Input, see the README.
+echo "==> Installing the 'Slovenian (Windows)' keyboard layout..."
+mkdir -p "$HOME/Library/Keyboard Layouts"
+cp "$SCRIPT_DIR/keylayout/Slovenian (Windows).keylayout" "$HOME/Library/Keyboard Layouts/"
+
 echo "==> Loading LaunchAgent..."
 launchctl load "$PLIST_PATH"
 

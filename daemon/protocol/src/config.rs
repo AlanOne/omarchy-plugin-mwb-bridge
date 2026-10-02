@@ -35,6 +35,11 @@ pub struct Config {
     // applied first, then this multiplier on top for the user to taste.
     #[serde(default = "default_scroll_speed")]
     pub scroll_speed: f64,
+    // macOS only: make the Windows keyboard behave the way it does on
+    // Windows (Ctrl+C copies, Home/End, Alt+Tab...) — see the macOS crate's
+    // `windows_keys.rs`. Toggled from the menu bar; ignored on Linux.
+    #[serde(default = "default_windows_keys")]
+    pub windows_keys: bool,
 }
 
 fn default_xkb_layout() -> String {
@@ -43,6 +48,10 @@ fn default_xkb_layout() -> String {
 
 fn default_scroll_speed() -> f64 {
     1.0
+}
+
+fn default_windows_keys() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]

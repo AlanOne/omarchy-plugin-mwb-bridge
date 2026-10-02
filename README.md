@@ -206,6 +206,25 @@ need re-confirming after a rebuild, since the signature changes each time
 — see the comment in `install.sh` for the stable-signing alternative if
 that gets annoying.
 
+**Keyboard layout (one-time, also manual).** Apple's own "Slovenian" layout
+is a different layout from the Windows one (QWERTY, different punctuation and
+Option characters), so with it the Windows keyboard types wrong characters.
+`install.sh` installs **Slovenian (Windows)**, generated from Microsoft's own
+Windows Slovenian definition (`daemon/macos/packaging/keylayout/`: `kbdcr.klc`
++ `gen_keylayout.py`, re-run the script after changing `keycode_macos.rs`).
+Pick it in System Settings > Keyboard > Text Input > Edit > + (under
+Slovenian or Others; log out and back in if it isn't listed), and remove
+Apple's Slovenian. AltGr is Right Alt as on Windows; Left Alt types the same
+characters, since a Mac layout can't tell the two Option keys apart.
+
+**Windows-style keys** (menu bar toggle, on by default): Ctrl and Win swap
+so Ctrl+C/V/Z/... work as on Windows, except in terminals, where Ctrl stays a
+real Ctrl and Ctrl+Shift+C/V copy/paste. Also Home/End and Ctrl+Home/End in
+text fields, Ctrl+arrows/Backspace/Delete by word, Alt+Tab, Alt+F4, a lone
+Win tap for Spotlight, Win+E for a Finder window, Win+Shift+S to snip to the
+clipboard, and Finder's Enter/Backspace/Delete/F2. Rules live in
+`daemon/macos/src/windows_keys.rs`.
+
 For quick iteration without the full install (no autostart, no bundle):
 
 ```sh

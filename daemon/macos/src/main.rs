@@ -43,6 +43,68 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
 // appears to need it. See the mwb-omarchy-bridge project memory.
 const LISTEN_PORT: u16 = 15101;
 
+/// Local wall-clock time as HH:MM:SS.mmm, for lining log lines up with when
+/// a hitch was felt.
+fn timestamp() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    format!("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, now.subsec_millis())
+}
+
+/// Bytes already waiting in the socket's receive buffer.
+fn bytes_queued(stream: &TcpStream) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut n: libc::c_int = 0;
+    if unsafe { libc::ioctl(stream.as_raw_fd(), libc::FIONREAD, &mut n) } == 0 { n.max(0) as usize } else { 0 }
+}
+
+// Input hitch diagnostics (see LagMonitor).
+const LAG_GAP: Duration = Duration::from_millis(40);
+const LAG_BURST_PACKETS: usize = 4;
+const LAG_SLOW_INJECT: Duration = Duration::from_millis(8);
+
+/// Logs input hitches and which side caused them: a gap in input followed
+/// by several packets already queued at once means the network held them
+/// back (Windows sent them during the gap); an event that took long to
+/// inject means this Mac was slow.
+struct LagMonitor {
+    last_input: Option<std::time::Instant>,
+}
+
+impl LagMonitor {
+    fn new() -> Self {
+        Self { last_input: None }
+    }
+
+    /// Call when an input packet has just been read.
+    fn arrived(&mut self, stream: &TcpStream) {
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_input.replace(now) {
+            let gap = now.duration_since(prev);
+            if gap >= LAG_GAP && gap < Duration::from_secs(2) {
+                let queued = bytes_queued(stream) / PACKAGE_SIZE;
+                if queued >= LAG_BURST_PACKETS {
+                    println!(
+                        "[lag] {} network stall: no input for {} ms, then {queued} more packets arrived at once",
+                        timestamp(),
+                        gap.as_millis()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Call after injecting an input packet that started at `started`.
+    fn injected(&self, kind: &str, started: std::time::Instant) {
+        let took = started.elapsed();
+        if took >= LAG_SLOW_INJECT {
+            println!("[lag] {} slow on this Mac: injecting {kind} took {} ms", timestamp(), took.as_millis());
+        }
+    }
+}
+
 fn set_socket_timeouts(stream: &TcpStream) {
     let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
@@ -104,6 +166,7 @@ fn run_session(
     // Must stay unique across reconnects, not just within this connection
     // (see initial_package_id and build_clipboard_text_packages).
     let mut next_clip_id: u32 = initial_package_id();
+    let mut lag = LagMonitor::new();
 
     loop {
         if let Some((clip_rx, shared)) = clipboard.as_ref() {
@@ -192,9 +255,13 @@ fn run_session(
                 let wheel = unpack_u32_le(&full, 24);
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(cg) = cg.as_deref_mut() {
+                    lag.arrived(stream);
+                    let started = std::time::Instant::now();
+                    let switch = handle_mouse(cg, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed);
+                    lag.injected(if flags == 0x200 { "a mouse move" } else { "a click/scroll" }, started);
                     // Relative mode: the cursor was pushed off the edge facing
                     // Windows or a configured neighbour, so ask Windows to switch.
-                    if let Some(back) = handle_mouse(cg, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed) {
+                    if let Some(back) = switch {
                         let windows_id = unpack_u32_le(&full, 8);
                         let mut pkg = build_next_machine(next_clip_id, cfg.machine_id, windows_id, back.x, back.y, back.to.unwrap_or(windows_id));
                         next_clip_id = next_clip_id.wrapping_add(1);
@@ -214,7 +281,10 @@ fn run_session(
                     cg_input::lock_screen();
                 }
                 if let Some(cg) = cg.as_deref_mut() {
+                    lag.arrived(stream);
+                    let started = std::time::Instant::now();
                     handle_keyboard(cg, &mut kb_state, vk, flags);
+                    lag.injected("a key", started);
                 }
             }
             PACKAGE_TYPE_CLIPBOARD_TEXT | PACKAGE_TYPE_CLIPBOARD_IMAGE => {
@@ -363,7 +433,7 @@ fn network_thread(cfg: Config) {
     let mut cg = CgInput::new();
     loop {
         if let Err(e) = run_client(&cfg, &mut cg, &clip_rx, &clip_shared) {
-            eprintln!("Connection ended: {e}. Reconnecting in 3s...");
+            eprintln!("{} Connection ended: {e}. Reconnecting in 3s...", timestamp());
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
         }
         std::thread::sleep(Duration::from_secs(3));

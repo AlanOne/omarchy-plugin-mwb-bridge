@@ -52,6 +52,21 @@ const DOUBLE_CLICK_DISTANCE: f64 = 5.0;
 // alongside config.json's scroll_speed multiplier if it still feels off.
 const PIXELS_PER_SCROLL_UNIT: f64 = 6.0;
 
+// CGEventPost is asynchronous: reading the cursor position back right after
+// posting a move can still return where it was *before* that move. Applying
+// the next relative delta to that stale position threw movement away and
+// jerked the cursor back (stutter), and a click posted there landed a few
+// pixels off. So the position we last posted is the truth while we're
+// actively moving it, and the live cursor is only re-read after a gap this
+// long — by then our own events are processed, and anything else that moved
+// it (the Mac's own trackpad, an app warping the cursor) shows up.
+const POSITION_RESYNC_AFTER: Duration = Duration::from_millis(60);
+// The display layout is re-read at most this often rather than on every
+// mouse event (each read is a round trip to the WindowServer).
+const DISPLAY_BOUNDS_REFRESH: Duration = Duration::from_secs(1);
+// How often relative moves re-check whether the cursor is hidden.
+const CURSOR_VISIBILITY_REFRESH: Duration = Duration::from_millis(200);
+
 /// The bounding rectangle across every active display, in Quartz's global
 /// coordinate space (origin top-left of the main display; a display to its
 /// left/below has negative origin coordinates) — what MWB's 0..=65535
@@ -105,12 +120,19 @@ pub struct CgInput {
     // works too, but keeping our own last-posted position avoids an extra
     // syscall per event and matches what we just told the OS to do anyway.
     pos: CGPoint,
-    // Which button is currently held, if any — determines whether a move
-    // posts as MouseMoved or a *Dragged variant (see `move_absolute`'s doc
-    // comment for why this matters: window/text-selection drag tracking
-    // specifically listens for the Dragged event types, not MouseMoved with
-    // a button field set).
-    held_button: Option<(CGEventType, Option<i64>)>,
+    // When we last posted a mouse event (see POSITION_RESYNC_AFTER).
+    last_mouse_post: Option<Instant>,
+    bounds: CGRect,
+    bounds_read: Instant,
+    cursor_shown: bool,
+    cursor_shown_read: Option<Instant>,
+    // Buttons currently held, oldest first, as (evdev code, down type,
+    // button field) — determines whether a move posts as MouseMoved or a
+    // *Dragged variant (see `move_absolute`'s doc comment for why this
+    // matters: window/text-selection drag tracking specifically listens for
+    // the Dragged event types, not MouseMoved with a button field set). A
+    // list, so releasing a second button mid-drag keeps the drag going.
+    held_buttons: Vec<(u32, CGEventType, Option<i64>)>,
     // Double/triple-click tracking (see `button`'s doc comment) — macOS
     // apps use the click-count field to distinguish a single click from a
     // double-click (e.g. title-bar zoom), which CGEventCreateMouseEvent
@@ -146,7 +168,12 @@ impl CgInput {
             source,
             flags: CGEventFlags::CGEventFlagNull,
             pos,
-            held_button: None,
+            last_mouse_post: None,
+            bounds,
+            bounds_read: Instant::now(),
+            cursor_shown: true,
+            cursor_shown_read: None,
+            held_buttons: Vec::new(),
             last_click_button: None,
             last_click_time: Instant::now(),
             last_click_pos: pos,
@@ -306,11 +333,84 @@ impl CgInput {
         }
     }
 
-    fn post_mouse(&self, event_type: CGEventType, button_field: Option<i64>, click_count: Option<i64>) {
+    /// Releases everything this sink still has held down — buttons, posted
+    /// modifier keys, rewritten keys, the app switcher — and forgets the
+    /// modifier state. Called whenever a connection starts or ends: a
+    /// release lost to a dropped connection otherwise left e.g. Command held
+    /// (every later click became a Command-click, and every key a shortcut)
+    /// or the left button held (every later move became a drag).
+    pub fn reset(&mut self) {
+        while let Some((_, down_type, field)) = self.held_buttons.pop() {
+            let up_type = match down_type {
+                CGEventType::LeftMouseDown => CGEventType::LeftMouseUp,
+                CGEventType::RightMouseDown => CGEventType::RightMouseUp,
+                _ => CGEventType::OtherMouseUp,
+            };
+            self.sync_position();
+            self.post_mouse(up_type, field, Some(self.click_count));
+        }
+        self.mods = ModifierState::default();
+        self.flags = CGEventFlags::CGEventFlagNull;
+        for (_, keycode) in std::mem::take(&mut self.posted_modifiers) {
+            self.post_key(keycode, false, self.flags, CGEventTapLocation::HID, false);
+        }
+        for (_, rewritten) in std::mem::take(&mut self.rewritten) {
+            if let Some((kc, flags, location)) = rewritten {
+                self.post_key(kc, false, flags, location, false);
+            }
+        }
+        if std::mem::take(&mut self.app_switch_open) {
+            self.post_key(windows_keys::VK_COMMAND, false, self.flags, CGEventTapLocation::Session, false);
+        }
+        self.win_tapped = false;
+        self.altgr_ctrl_cancelled = false;
+        self.ctrl_as_command = true;
+        self.win_as_control = true;
+    }
+
+    fn desktop_bounds(&mut self) -> CGRect {
+        if self.bounds_read.elapsed() >= DISPLAY_BOUNDS_REFRESH {
+            self.bounds = virtual_desktop_bounds();
+            self.bounds_read = Instant::now();
+        }
+        self.bounds
+    }
+
+    /// Picks up the live cursor position, unless we've posted a mouse event
+    /// too recently for it to be trustworthy (see POSITION_RESYNC_AFTER).
+    fn sync_position(&mut self) {
+        if self.last_mouse_post.is_none_or(|t| t.elapsed() >= POSITION_RESYNC_AFTER)
+            && let Ok(e) = CGEvent::new(self.source.clone())
+        {
+            self.pos = e.location();
+        }
+    }
+
+    fn cursor_shown(&mut self) -> bool {
+        if self.cursor_shown_read.is_none_or(|t| t.elapsed() >= CURSOR_VISIBILITY_REFRESH) {
+            self.cursor_shown = cursor_visible();
+            self.cursor_shown_read = Some(Instant::now());
+        }
+        self.cursor_shown
+    }
+
+    /// The event type (and button field) a move posts as: a drag of the
+    /// earliest still-held button, or a plain move.
+    fn move_type(&self) -> (CGEventType, Option<i64>) {
+        match self.held_buttons.first() {
+            Some((_, CGEventType::LeftMouseDown, _)) => (CGEventType::LeftMouseDragged, None),
+            Some((_, CGEventType::RightMouseDown, _)) => (CGEventType::RightMouseDragged, None),
+            Some((_, _, field)) => (CGEventType::OtherMouseDragged, *field),
+            None => (CGEventType::MouseMoved, None),
+        }
+    }
+
+    fn post_mouse(&mut self, event_type: CGEventType, button_field: Option<i64>, click_count: Option<i64>) {
         self.post_mouse_with_delta(event_type, button_field, click_count, None);
     }
 
-    fn post_mouse_with_delta(&self, event_type: CGEventType, button_field: Option<i64>, click_count: Option<i64>, delta: Option<(i64, i64)>) {
+    fn post_mouse_with_delta(&mut self, event_type: CGEventType, button_field: Option<i64>, click_count: Option<i64>, delta: Option<(i64, i64)>) {
+        self.last_mouse_post = Some(Instant::now());
         let Ok(event) = CGEvent::new_mouse_event(self.source.clone(), event_type, self.pos, CGMouseButton::Left) else {
             eprintln!("(cg_input: failed to create mouse event)");
             return;
@@ -344,7 +444,7 @@ impl InputSink for CgInput {
     /// rectangle across every active display — see `virtual_desktop_bounds`.
     ///
     /// Posts a `*MouseDragged` event instead of plain `MouseMoved` whenever
-    /// a button is currently held (`held_button`, set by `button` below) —
+    /// a button is currently held (`held_buttons`, set by `button` below) —
     /// confirmed live, 2026-09-22, this is required, not cosmetic: window
     /// dragging and title-bar double-click-to-zoom both rely on the
     /// WindowServer's live drag-tracking, which specifically watches for
@@ -353,7 +453,7 @@ impl InputSink for CgInput {
     /// dragged window never visually followed the cursor, only snapping to
     /// its final position on mouse-up.
     fn move_absolute(&mut self, x: u32, y: u32, x_extent: u32, y_extent: u32) {
-        let bounds = virtual_desktop_bounds();
+        let bounds = self.desktop_bounds();
         let fx = x as f64 / x_extent as f64;
         let fy = y as f64 / y_extent as f64;
         let previous = self.pos;
@@ -363,12 +463,7 @@ impl InputSink for CgInput {
         // it a posted move looks like no movement at all. Live-reported 2026-10-02 (Adrift's
         // mouse-look didn't turn).
         let delta = ((self.pos.x - previous.x).round() as i64, (self.pos.y - previous.y).round() as i64);
-        let (event_type, button_field) = match self.held_button {
-            Some((CGEventType::LeftMouseDown, _)) => (CGEventType::LeftMouseDragged, None),
-            Some((CGEventType::RightMouseDown, _)) => (CGEventType::RightMouseDragged, None),
-            Some((CGEventType::OtherMouseDown, field)) => (CGEventType::OtherMouseDragged, field),
-            _ => (CGEventType::MouseMoved, None),
-        };
+        let (event_type, button_field) = self.move_type();
         self.post_mouse_with_delta(event_type, button_field, None, Some(delta));
     }
 
@@ -378,13 +473,23 @@ impl InputSink for CgInput {
     /// than position. Reports an edge exit only while the cursor is visible,
     /// so mouse-look in a game never hands control back to Windows.
     fn move_relative(&mut self, dx: i32, dy: i32) -> Option<EdgeExit> {
-        let bounds = virtual_desktop_bounds();
-        let current = CGEvent::new(self.source.clone()).map(|e| e.location()).unwrap_or(self.pos);
+        let bounds = self.desktop_bounds();
+        // A hidden cursor usually means an app is warping it (mouse-look), so
+        // follow the live position then; otherwise see POSITION_RESYNC_AFTER.
+        if self.cursor_shown() {
+            self.sync_position();
+        } else if let Ok(e) = CGEvent::new(self.source.clone()) {
+            self.pos = e.location();
+        }
+        let current = self.pos;
         let (min_x, min_y) = (bounds.origin.x, bounds.origin.y);
         let (max_x, max_y) = (min_x + bounds.size.width - 1.0, min_y + bounds.size.height - 1.0);
         let (tx, ty) = (current.x + dx as f64, current.y + dy as f64);
+        let outside = tx < min_x || tx > max_x || ty < min_y || ty > max_y;
 
-        let exit = if !cursor_visible() {
+        // Visibility re-checked live at the edge itself: the cached value may
+        // be up to CURSOR_VISIBILITY_REFRESH old.
+        let exit = if !outside || !cursor_visible() {
             None
         } else if tx < min_x {
             Some(EdgeExit { edge: ScreenEdge::Left, along: (ty - min_y) / bounds.size.height })
@@ -399,12 +504,7 @@ impl InputSink for CgInput {
         };
 
         self.pos = CGPoint::new(tx.clamp(min_x, max_x), ty.clamp(min_y, max_y));
-        let (event_type, button_field) = match self.held_button {
-            Some((CGEventType::LeftMouseDown, _)) => (CGEventType::LeftMouseDragged, None),
-            Some((CGEventType::RightMouseDown, _)) => (CGEventType::RightMouseDragged, None),
-            Some((CGEventType::OtherMouseDown, field)) => (CGEventType::OtherMouseDragged, field),
-            _ => (CGEventType::MouseMoved, None),
-        };
+        let (event_type, button_field) = self.move_type();
         self.post_mouse_with_delta(event_type, button_field, None, Some((dx as i64, dy as i64)));
         exit
     }
@@ -412,7 +512,7 @@ impl InputSink for CgInput {
     /// Posts button down/up, tracking two bits of state real hardware click
     /// streams carry implicitly but `CGEventCreateMouseEvent` doesn't infer
     /// on its own:
-    /// - **Held-button state** (`held_button`), consumed by `move_absolute`
+    /// - **Held-button state** (`held_buttons`), consumed by `move_absolute`
     ///   above to post drag events instead of plain moves.
     /// - **Click count** (`EventField::MOUSE_EVENT_CLICK_STATE`): a second
     ///   press of the same button, close in time and position to the first
@@ -435,7 +535,17 @@ impl InputSink for CgInput {
             _ => return,
         };
 
+        // Click where the cursor really is: if something else moved it since
+        // our last move (the Mac's own trackpad, an app), clicking at our
+        // remembered spot would yank it back and click the wrong thing.
+        self.sync_position();
         if pressed {
+            // A press for a button we think is already down means its
+            // release got lost: release it first so the app sees a clean click.
+            if let Some(i) = self.held_buttons.iter().position(|b| b.0 == button_code) {
+                self.held_buttons.remove(i);
+                self.post_mouse(up_type, button_field, Some(self.click_count));
+            }
             let now = Instant::now();
             let dx = self.pos.x - self.last_click_pos.x;
             let dy = self.pos.y - self.last_click_pos.y;
@@ -451,10 +561,10 @@ impl InputSink for CgInput {
             self.last_click_button = Some(button_code);
             self.last_click_time = now;
             self.last_click_pos = self.pos;
-            self.held_button = Some((down_type, button_field));
+            self.held_buttons.push((button_code, down_type, button_field));
             self.post_mouse(down_type, button_field, Some(self.click_count));
         } else {
-            self.held_button = None;
+            self.held_buttons.retain(|b| b.0 != button_code);
             self.post_mouse(up_type, button_field, Some(self.click_count));
         }
     }

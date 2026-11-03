@@ -279,7 +279,32 @@ fn run_client(
     config::write_status(false, "", "Connecting...");
     let mut stream = TcpStream::connect(&cfg.windows_ip)?;
     set_socket_timeouts(&stream);
-    run_session(&mut stream, Some(cg), cfg, Some((clip_rx, clip_shared)))
+    // Input is only sent one packet at a time; don't let Nagle batch the
+    // rare reply (e.g. NextMachine) behind a pending ACK.
+    let _ = stream.set_nodelay(true);
+    // A new connection starts with nothing held — see CgInput::reset.
+    cg.reset();
+    let result = run_session(&mut stream, Some(&mut *cg), cfg, Some((clip_rx, clip_shared)));
+    cg.reset();
+    result
+}
+
+/// Keeps forwarded input smooth while this menu-bar-only app has no visible
+/// window: macOS otherwise counts it as idle and App Naps it, which
+/// throttles its threads and delays socket wake-ups, so mouse packets
+/// arrive in bursts (stuttering movement, late or lost-feeling clicks). Also
+/// runs the calling (network) thread at the QoS real input handling uses.
+/// Idle system sleep stays allowed.
+fn keep_input_responsive() {
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    let options = NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | NSActivityOptions::LatencyCritical;
+    let activity = NSProcessInfo::processInfo()
+        .beginActivityWithOptions_reason(options, &NSString::from_str("Forwarding mouse and keyboard input"));
+    // Held for the life of the process.
+    std::mem::forget(activity);
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
 }
 
 /// Accepts Windows' own reverse connection back to us — see `LISTEN_PORT`'s
@@ -313,6 +338,7 @@ fn run_server_listener(cfg: Config) {
 }
 
 fn network_thread(cfg: Config) {
+    keep_input_responsive();
     windows_keys::ENABLED.store(cfg.windows_keys, std::sync::atomic::Ordering::Relaxed);
     {
         let cfg = cfg.clone();

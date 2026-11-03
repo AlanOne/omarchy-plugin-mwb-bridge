@@ -1365,6 +1365,7 @@ dependencies = [
  "libc",
  "muda",
  "mwb_protocol",
+ "objc2-foundation 0.3.2",
  "rand",
  "serde_json",
  "tao",

@@ -8,7 +8,9 @@
 // daemon after saving a change, matching how Cameras' go2rtc container is
 // restarted after config edits rather than hot-reloaded.
 
+use crate::input_handling::ScreenEdge;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,6 +49,19 @@ pub struct Config {
     // enters when unset.
     #[serde(default)]
     pub windows_side: Option<String>,
+    // Relative mode only: edges that lead to another machine in MWB's layout
+    // rather than Windows, as edge -> that machine's MWB id (its number in
+    // Windows' MachinePool), e.g. {"right": 3}. Windows is asked to switch
+    // straight to it, so the cursor doesn't detour through Windows.
+    #[serde(default)]
+    pub neighbors: HashMap<String, u32>,
+}
+
+impl Config {
+    /// `neighbors` with its edge names parsed; unknown names are dropped.
+    pub fn neighbor_edges(&self) -> Vec<(ScreenEdge, u32)> {
+        self.neighbors.iter().filter_map(|(edge, &id)| Some((ScreenEdge::parse(edge)?, id))).collect()
+    }
 }
 
 fn default_xkb_layout() -> String {

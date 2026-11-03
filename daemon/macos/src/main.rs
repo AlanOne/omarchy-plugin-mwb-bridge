@@ -96,15 +96,14 @@ fn run_session(
     println!("[client] Handshake sent, entering receive loop.");
 
     let mut kb_state = KeyboardState::new();
-    let mut mouse_state = MouseState::new(cfg.windows_side.as_deref().and_then(ScreenEdge::parse));
+    let mut mouse_state = MouseState::new(cfg.windows_side.as_deref().and_then(ScreenEdge::parse), cfg.neighbor_edges());
     let mut lock_combo = LockComboDetector::new();
     let mut hi_count = 0u64;
     let mut clipboard_buf: Vec<u8> = Vec::new();
     let mut clipboard_kind: Option<u8> = None;
-    // Arbitrary starting value distinct from the handshake's id=1 above —
-    // just needs to be unique per outgoing package within this connection
-    // (see build_clipboard_text_packages's doc comment on why).
-    let mut next_clip_id: u32 = 1000;
+    // Must stay unique across reconnects, not just within this connection
+    // (see initial_package_id and build_clipboard_text_packages).
+    let mut next_clip_id: u32 = initial_package_id();
 
     loop {
         if let Some((clip_rx, shared)) = clipboard.as_ref() {
@@ -194,10 +193,10 @@ fn run_session(
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(cg) = cg.as_deref_mut() {
                     // Relative mode: the cursor was pushed off the edge facing
-                    // Windows, so ask Windows to take control back.
+                    // Windows or a configured neighbour, so ask Windows to switch.
                     if let Some(back) = handle_mouse(cg, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed) {
                         let windows_id = unpack_u32_le(&full, 8);
-                        let mut pkg = build_next_machine(next_clip_id, cfg.machine_id, windows_id, back.x, back.y, windows_id);
+                        let mut pkg = build_next_machine(next_clip_id, cfg.machine_id, windows_id, back.x, back.y, back.to.unwrap_or(windows_id));
                         next_clip_id = next_clip_id.wrapping_add(1);
                         finalize_send_buf(&mut pkg, magic_number);
                         let ct = cipher.encrypt(&mut write_chain, &pkg);

@@ -301,6 +301,21 @@ pub fn build_machine_switched(id: u32, src_id: u32, des_id: u32) -> [u8; PACKAGE
     buf
 }
 
+/// Starting value for a connection's outgoing package ids. MWB drops any
+/// package whose id matches one of the last 50 it processed, across
+/// reconnects (real MWB even persists its counter in settings), so a fixed
+/// start like 1000 made every reconnect's first NextMachine a silent
+/// duplicate. Seeded from the clock instead: it advances far faster than we
+/// send packages, so a new connection never reuses a recent id.
+pub fn initial_package_id() -> u32 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Positive i32 range (MWB reads ids as int) and well above the handshake's id=1.
+    (ms % 0x3FFF_0000) as u32 + 0x1_0000
+}
+
 /// Builds a NextMachine package (Type=121) — see its constant doc comment.
 /// `des_id` is the controller we're asking, `next_machine` the machine to
 /// switch to (the controller itself, when handing control back).

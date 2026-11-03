@@ -30,6 +30,9 @@ BarWidget {
   readonly property string home: Quickshell.env("HOME")
   readonly property string dataDir: root.home + "/.local/share/omarchy-mwb-bridge"
   readonly property string configPath: root.dataDir + "/config.json"
+  // Last-loaded config.json as-is, so saving keeps keys the form doesn't
+  // edit (windows_side, neighbors) instead of silently dropping them.
+  property var loadedConfig: ({})
   readonly property string statusPath: root.dataDir + "/status.json"
   readonly property string serviceName: "mwb-omarchy-bridge.service"
   readonly property string windowsSideDocsUrl: "https://github.com/AlanOne/omarchy-plugin-mwb-bridge/blob/master/README.md#on-the-windows-side"
@@ -122,14 +125,14 @@ BarWidget {
 
   Process {
     id: buildDaemonProc
-    command: ["cargo", "build", "--release", "--target-dir", root.buildCacheDir]
+    command: ["cargo", "build", "--release", "-p", "mwb_omarchy_bridge", "--target-dir", root.buildCacheDir]
     workingDirectory: root.daemonDir
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.setupStatus = ""
         root.ensureServiceUnit()
       } else {
-        root.setupStatus = "Daemon build failed — install Rust (rustup.rs), then run `cargo build --release` in " + root.daemonDir + " yourself."
+        root.setupStatus = "Daemon build failed — install Rust (rustup.rs), then run `cargo build --release -p mwb_omarchy_bridge` in " + root.daemonDir + " yourself."
       }
     }
   }
@@ -235,6 +238,7 @@ BarWidget {
     onLoaded: {
       try {
         var c = JSON.parse(String(text() || ""))
+        root.loadedConfig = c
         keyField.text = String(c.security_key || "")
         ipField.text = String(c.windows_ip || "")
         nameField.text = String(c.machine_name || "")
@@ -256,7 +260,7 @@ BarWidget {
 
   function saveSettings() {
     var parsedScroll = Number(scrollField.text)
-    var cfg = {
+    var cfg = Object.assign({}, root.loadedConfig, {
       security_key: keyField.text,
       windows_ip: ipField.text.trim(),
       machine_name: nameField.text.trim(),
@@ -264,7 +268,8 @@ BarWidget {
       xkb_layout: root.detectedXkbLayout,
       xkb_variant: root.detectedXkbVariant,
       scroll_speed: (parsedScroll > 0 ? parsedScroll : 1.0)
-    }
+    })
+    root.loadedConfig = cfg
     configFile.setText(JSON.stringify(cfg, null, 2) + "\n")
     chmodProc.running = true
     restartProc.running = true

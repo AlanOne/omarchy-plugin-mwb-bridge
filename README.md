@@ -267,7 +267,12 @@ Turn on **Move mouse relatively** in PowerToys' Mouse Without Borders settings a
 handle it: Windows sends raw movement, and the bridge itself notices the cursor being pushed off the
 edge that faces Windows and hands control back (a `NextMachine` package). That edge is learned from
 where the cursor enters after a switch; set `"windows_side": "left"` (or right/top/bottom) in
-config.json to fix it instead. While an app hides the cursor (a game's mouse-look), the macOS bridge
+config.json to fix it instead.
+
+If an edge leads to another machine instead of Windows (e.g. a desk laid out laptop | Mac | PC),
+map it in `neighbors` by that machine's MWB id (its number in Windows' `MachinePool`, e.g.
+`alan-mac:3`): `"neighbors": { "right": 3 }`. Pushing off that edge asks Windows to switch straight
+to that machine. A neighbour edge wins over a learned `windows_side`. While an app hides the cursor (a game's mouse-look), the macOS bridge
 never switches back at an edge; free the cursor (usually Esc) or use MWB's switch hotkey.
 
 The setting applies to every machine Windows controls, so update both bridges before turning it on.

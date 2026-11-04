@@ -521,21 +521,7 @@ fn run_session(
     shared: &ClipboardShared,
 ) -> std::io::Result<()> {
     let magic_number = get_24bit_hash(&cfg.security_key);
-    let key = derive_key(&cfg.security_key);
-    let iv = derive_iv();
-
-    let cipher = CbcState::new(&key);
-    let mut read_chain = iv;
-    let mut write_chain = iv;
-
-    let mut priming_out = [0u8; 16];
-    rand::rng().fill(&mut priming_out);
-    let ct = cipher.encrypt(&mut write_chain, &priming_out);
-    stream.write_all(&ct)?;
-
-    let mut priming_in_ct = [0u8; 16];
-    stream.read_exact(&mut priming_in_ct)?;
-    let _ = cipher.decrypt(&mut read_chain, &priming_in_ct);
+    let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
 
     let our_machine1_4: [u32; 4] = {
         let mut r = rand::rng();
@@ -742,21 +728,6 @@ fn run_session(
     }
 }
 
-/// Runs the priming-block dance that starts every MWB connection (message
-/// server or clipboard server alike) — shared so the two clipboard-server
-/// functions below don't duplicate `run_session`'s own copy of this.
-fn prime_connection(stream: &mut TcpStream, cipher: &CbcState, write_chain: &mut [u8; 16], read_chain: &mut [u8; 16]) -> std::io::Result<()> {
-    let mut priming_out = [0u8; 16];
-    rand::rng().fill(&mut priming_out);
-    let ct = cipher.encrypt(write_chain, &priming_out);
-    stream.write_all(&ct)?;
-
-    let mut priming_in_ct = [0u8; 16];
-    stream.read_exact(&mut priming_in_ct)?;
-    let _ = cipher.decrypt(read_chain, &priming_in_ct);
-    Ok(())
-}
-
 /// Connects to Windows' *separate* clipboard-server socket (port 15100) to
 /// pull a file it just announced via a beat on the message server, and
 /// applies it to the local clipboard once fully received. See PROTOCOL.md's
@@ -779,10 +750,7 @@ fn pull_file_from_windows(cfg: &Config, peer_addr: Option<std::net::SocketAddr>,
     };
     set_socket_timeouts(&stream);
 
-    let cipher = CbcState::new(&derive_key(&cfg.security_key));
-    let mut read_chain = derive_iv();
-    let mut write_chain = derive_iv();
-    prime_connection(&mut stream, &cipher, &mut write_chain, &mut read_chain)?;
+    let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
     println!("[file-pull] Primed.");
 
     // We're pulling/receiving on this connection, so our handshake type is
@@ -849,10 +817,7 @@ fn pull_file_from_windows(cfg: &Config, peer_addr: Option<std::net::SocketAddr>,
 /// (see PROTOCOL.md): its own auto-pull is gated on a "machine switched"
 /// event this bridge's topology doesn't have an equivalent of.
 fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option<PendingOutbound>>>) -> std::io::Result<()> {
-    let cipher = CbcState::new(&derive_key(&cfg.security_key));
-    let mut read_chain = derive_iv();
-    let mut write_chain = derive_iv();
-    prime_connection(&mut stream, &cipher, &mut write_chain, &mut read_chain)?;
+    let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
 
     // We're about to push the actual bytes, so our handshake type is
     // ClipboardPush. No finalize_send_buf here — see the comment in

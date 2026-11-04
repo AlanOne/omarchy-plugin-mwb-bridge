@@ -380,20 +380,6 @@ pub fn announce_big_image(
     Ok(())
 }
 
-fn prime_connection(stream: &mut TcpStream, cipher: &CbcState, write_chain: &mut [u8; 16], read_chain: &mut [u8; 16]) -> std::io::Result<()> {
-    use std::io::Write;
-    use rand::RngExt;
-    let mut priming_out = [0u8; 16];
-    rand::rng().fill(&mut priming_out);
-    let ct = cipher.encrypt(write_chain, &priming_out);
-    stream.write_all(&ct)?;
-
-    let mut priming_in_ct = [0u8; 16];
-    stream.read_exact(&mut priming_in_ct)?;
-    let _ = cipher.decrypt(read_chain, &priming_in_ct);
-    Ok(())
-}
-
 /// Returns `addr` with its port changed, preserving an IPv6 address's scope
 /// ID/flow info if present — see the Linux build's identical helper for why
 /// this matters (a plain `SocketAddr::new` silently drops a link-local
@@ -450,10 +436,7 @@ pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &C
     let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(300)));
 
-    let cipher = CbcState::new(&derive_key(&cfg.security_key));
-    let mut read_chain = derive_iv();
-    let mut write_chain = derive_iv();
-    prime_connection(&mut stream, &cipher, &mut write_chain, &mut read_chain)?;
+    let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
 
     // Pulling/receiving, so our handshake type is Clipboard (not
     // ClipboardPush — that's Windows' side, since it's about to push the
@@ -525,10 +508,7 @@ fn safe_file_name(windows_path: &str) -> String {
 /// build's `serve_file_to_peer`, image-only.
 fn serve_pending_image(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option<PathBuf>>>) -> std::io::Result<()> {
     use std::io::Write;
-    let cipher = CbcState::new(&derive_key(&cfg.security_key));
-    let mut read_chain = derive_iv();
-    let mut write_chain = derive_iv();
-    prime_connection(&mut stream, &cipher, &mut write_chain, &mut read_chain)?;
+    let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
 
     let hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD_PUSH, cfg.machine_id, &cfg.machine_name);
     stream.write_all(&cipher.encrypt(&mut write_chain, &hs))?;

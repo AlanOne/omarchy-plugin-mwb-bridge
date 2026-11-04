@@ -1,4 +1,4 @@
-// Shared MWB v0.98.1 protocol primitives (crypto, framing, packet
+// Shared MWB (PowerToys v0.102+) protocol primitives (crypto, framing, packet
 // building/parsing) — see PROTOCOL.md for the full spec and why each piece
 // is the way it is. Extracted from the original mwb_probe.rs test client so
 // the real daemon doesn't duplicate this.
@@ -13,7 +13,6 @@ use sha2::{Digest, Sha512};
 
 pub const PACKAGE_SIZE: usize = 32;
 pub const PACKAGE_SIZE_EX: usize = 64;
-pub const INITIAL_IV: &str = "18446744073709551615";
 
 pub const PACKAGE_TYPE_HI: u8 = 2;
 pub const PACKAGE_TYPE_HELLO: u8 = 3;
@@ -85,15 +84,53 @@ pub fn utf16le_bytes(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
-pub fn derive_key(security_key: &str) -> [u8; 32] {
-    let salt = utf16le_bytes(INITIAL_IV);
+// Per-connection encryption, PowerToys v0.102+ (Encryption.cs, #48742 and
+// #49600): each direction starts with a cleartext header of a random salt
+// and a random IV, and that direction's AES key is
+// PBKDF2-HMAC-SHA512(security_key, salt, 100000 rounds).
+const SALT_SIZE: usize = 16;
+const KEY_DERIVATION_ITERATIONS: u32 = 100_000;
+
+pub fn derive_key(security_key: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha512>(security_key.as_bytes(), &salt, 50_000, &mut key);
+    pbkdf2_hmac::<Sha512>(security_key.as_bytes(), salt, KEY_DERIVATION_ITERATIONS, &mut key);
     key
 }
 
-pub fn derive_iv() -> [u8; 16] {
-    INITIAL_IV.as_bytes()[..16].try_into().unwrap()
+/// An encrypted connection's cipher plus each direction's CBC chaining value.
+pub struct EncryptedStream {
+    pub cipher: CbcState,
+    pub write_chain: [u8; 16],
+    pub read_chain: [u8; 16],
+}
+
+/// Sets up encryption on a freshly connected MWB socket (message server and
+/// clipboard server alike), in either role: sends our cleartext salt+IV
+/// header and the encrypted 16-byte priming block, then reads the peer's
+/// header and priming block. We always write before reading, so it works
+/// whichever order the peer does them in.
+pub fn open_encrypted_stream<S: std::io::Read + Write>(stream: &mut S, security_key: &str) -> std::io::Result<EncryptedStream> {
+    use rand::RngExt;
+    let mut header = [0u8; SALT_SIZE + 16];
+    rand::rng().fill(&mut header);
+    stream.write_all(&header)?;
+    let encrypt_key = derive_key(security_key, &header[..SALT_SIZE]);
+    let mut write_chain: [u8; 16] = header[SALT_SIZE..].try_into().unwrap();
+
+    let mut cipher = CbcState::new(&encrypt_key);
+    let mut priming = [0u8; 16];
+    rand::rng().fill(&mut priming);
+    stream.write_all(&cipher.encrypt(&mut write_chain, &priming))?;
+
+    let mut peer_header = [0u8; SALT_SIZE + 16];
+    stream.read_exact(&mut peer_header)?;
+    cipher.set_decrypt_key(&derive_key(security_key, &peer_header[..SALT_SIZE]));
+    let mut read_chain: [u8; 16] = peer_header[SALT_SIZE..].try_into().unwrap();
+
+    let mut peer_priming = [0u8; 16];
+    stream.read_exact(&mut peer_priming)?;
+    let _ = cipher.decrypt(&mut read_chain, &peer_priming);
+    Ok(EncryptedStream { cipher, write_chain, read_chain })
 }
 
 /// Encryption.Get24BitHash: SHA-512 the (byte-truncated) key string once,
@@ -126,6 +163,12 @@ impl CbcState {
             aes_encrypt: aes::Aes256::new(key.into()),
             aes_decrypt: aes::Aes256::new(key.into()),
         }
+    }
+
+    /// Each direction has its own key since PowerToys v0.102 (see
+    /// `open_encrypted_stream`).
+    pub fn set_decrypt_key(&mut self, key: &[u8; 32]) {
+        self.aes_decrypt = aes::Aes256::new(key.into());
     }
 
     pub fn encrypt(&self, chain: &mut [u8; 16], plaintext: &[u8]) -> Vec<u8> {
@@ -412,4 +455,32 @@ pub fn validate_and_clean_recv_buf(buf: &mut [u8], magic_number: u32) -> bool {
     buf[2] = 0;
     buf[3] = 0;
     ok
+}
+
+#[cfg(test)]
+mod encryption_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    /// Both ends run the v0.102+ setup at once (each writes before reading,
+    /// like Windows may), then a package goes each way and decrypts.
+    #[test]
+    fn open_encrypted_stream_round_trips_both_directions() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut s = open_encrypted_stream(&mut b, "SharedKey0123456").unwrap();
+            let mut ct = [0u8; PACKAGE_SIZE];
+            b.read_exact(&mut ct).unwrap();
+            let pt = s.cipher.decrypt(&mut s.read_chain, &ct);
+            b.write_all(&s.cipher.encrypt(&mut s.write_chain, &pt)).unwrap();
+        });
+        let mut s = open_encrypted_stream(&mut a, "SharedKey0123456").unwrap();
+        let msg: Vec<u8> = (0..PACKAGE_SIZE as u8).collect();
+        a.write_all(&s.cipher.encrypt(&mut s.write_chain, &msg)).unwrap();
+        let mut ct = [0u8; PACKAGE_SIZE];
+        a.read_exact(&mut ct).unwrap();
+        assert_eq!(s.cipher.decrypt(&mut s.read_chain, &ct), msg);
+        peer.join().unwrap();
+    }
 }

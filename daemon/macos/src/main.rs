@@ -128,21 +128,7 @@ fn run_session(
     clipboard: Option<(&Receiver<ClipboardEvent>, &ClipboardShared)>,
 ) -> std::io::Result<()> {
     let magic_number = get_24bit_hash(&cfg.security_key);
-    let key = derive_key(&cfg.security_key);
-    let iv = derive_iv();
-
-    let cipher = CbcState::new(&key);
-    let mut read_chain = iv;
-    let mut write_chain = iv;
-
-    let mut priming_out = [0u8; 16];
-    rand::rng().fill(&mut priming_out);
-    let ct = cipher.encrypt(&mut write_chain, &priming_out);
-    stream.write_all(&ct)?;
-
-    let mut priming_in_ct = [0u8; 16];
-    stream.read_exact(&mut priming_in_ct)?;
-    let _ = cipher.decrypt(&mut read_chain, &priming_in_ct);
+    let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(stream, &cfg.security_key)?;
 
     let our_machine1_4: [u32; 4] = {
         let mut r = rand::rng();
@@ -167,6 +153,7 @@ fn run_session(
     // (see initial_package_id and build_clipboard_text_packages).
     let mut next_clip_id: u32 = initial_package_id();
     let mut lag = LagMonitor::new();
+    let mut invalid_count = 0u32;
 
     loop {
         if let Some((clip_rx, shared)) = clipboard.as_ref() {
@@ -222,6 +209,20 @@ fn run_session(
             full.extend_from_slice(&pt2);
         }
         if !valid {
+            // A peer using a different security key looks exactly like this:
+            // the connection opens, but nothing it sends decrypts.
+            invalid_count += 1;
+            // The first few, decrypted, so a protocol change on the Windows
+            // side can be told apart from a wrong key (garbage either way,
+            // but a wrong key leaves no structure at all).
+            if invalid_count <= 3 {
+                let hex: String = full.iter().map(|b| format!("{b:02x}")).collect();
+                println!("{} [client] Undecryptable package #{invalid_count} (raw type {package_type}): {hex}", timestamp());
+            }
+            if invalid_count == 5 {
+                println!("{} [client] Peer's packets don't decrypt with our security key — has it changed in PowerToys?", timestamp());
+                config::write_status(false, "", "Peer's packets don't decrypt — check the security key");
+            }
             continue;
         }
         let src_id = unpack_u32_le(&full, 8);

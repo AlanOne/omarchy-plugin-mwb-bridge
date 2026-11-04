@@ -470,11 +470,12 @@ impl InputSink for CgInput {
     /// Relative mode ("Move mouse relatively" in PowerToys): moves from where
     /// the cursor actually is (an app may have warped or locked it), keeps it
     /// on screen, and posts the raw delta for apps that read movement rather
-    /// than position. Reports an edge exit only while the cursor is visible,
-    /// so mouse-look in a game never hands control back to Windows.
+    /// than position. Reports an edge exit while the cursor is visible, or,
+    /// when it's hidden, only once it has really reached that edge — so
+    /// mouse-look in a game never hands control back to Windows.
     fn move_relative(&mut self, dx: i32, dy: i32) -> Option<EdgeExit> {
         let bounds = self.desktop_bounds();
-        // A hidden cursor usually means an app is warping it (mouse-look), so
+        // A hidden cursor may mean an app is warping it (mouse-look), so
         // follow the live position then; otherwise see POSITION_RESYNC_AFTER.
         if self.cursor_shown() {
             self.sync_position();
@@ -488,8 +489,17 @@ impl InputSink for CgInput {
         let outside = tx < min_x || tx > max_x || ty < min_y || ty > max_y;
 
         // Visibility re-checked live at the edge itself: the cached value may
-        // be up to CURSOR_VISIBILITY_REFRESH old.
-        let exit = if !outside || !cursor_visible() {
+        // be up to CURSOR_VISIBILITY_REFRESH old. A hidden cursor still exits
+        // if it's actually at the edge it's being pushed past: apps that hide
+        // it while you type (Ghostty's mouse-hide-while-typing, live-reported
+        // 2026-11-04 as "can't move the mouse back to the PC") leave it moving
+        // normally, while mouse-look locks it or keeps warping it back to the
+        // middle, so it never gets there.
+        let at_edge = (tx < min_x && current.x <= min_x + 1.0)
+            || (tx > max_x && current.x >= max_x - 1.0)
+            || (ty < min_y && current.y <= min_y + 1.0)
+            || (ty > max_y && current.y >= max_y - 1.0);
+        let exit = if !outside || !(at_edge || cursor_visible()) {
             None
         } else if tx < min_x {
             Some(EdgeExit { edge: ScreenEdge::Left, along: (ty - min_y) / bounds.size.height })

@@ -1,4 +1,4 @@
-# PowerToys Mouse Without Borders wire protocol (v0.98.1)
+# PowerToys Mouse Without Borders wire protocol (v0.98.1, encryption v0.102+)
 
 Reverse-engineered entirely from Microsoft's own MIT-licensed source
 (`microsoft/PowerToys`, module `MouseWithoutBorders`, tag `v0.98.1` — **not**
@@ -22,45 +22,43 @@ in this investigation — every mouse/keyboard/handshake packet lives on
 `"Tcp Server: AcceptConnectionAndSendClipboardData [::]:15100"` and
 `"TCP listening on port: 15101"` as two distinct log lines.
 
-## Encryption (v0.98.1 specific — NOT the same as `main`)
+## Encryption (PowerToys v0.102+)
 
-`main`'s `Encryption.cs` uses a random per-connection salt+IV exchanged in
-cleartext at the start of the stream (PBKDF2-SHA512, 100k iterations). This
-is a **newer, unreleased-as-of-0.98.1 hardening change**. v0.98.1 instead
-uses a **fixed, deterministic** key and IV — no per-connection handshake for
-the crypto itself at all:
+Changed in PowerToys v0.102 (`Encryption.cs`, PRs #48742 and #49600). The
+v0.98.1 scheme this bridge was first built against (fixed salt =
+UTF-16LE of `"18446744073709551615"`, fixed IV = its first 16 ASCII bytes,
+50,000 PBKDF2 rounds, no cleartext header) is **not** accepted by v0.102+:
+a v0.98.1-style client connects, gets a reply, but nothing either side sends
+decrypts, and Windows drops the socket after ~30-60 s. Found live
+2026-11-04, right after a PowerToys update, with an unchanged security key.
+
+Each TCP direction is its own stream with its own key:
 
 ```
-InitialIV = "18446744073709551615"          // literal decimal string of ulong.MaxValue
-
-salt = UTF-16LE bytes of InitialIV            // 40 bytes (2 bytes/char)
-key  = PBKDF2-HMAC-SHA512(security_key_utf8, salt, iterations=50000, output_len=32)
-
-iv   = ASCII bytes of InitialIV[0..16]        // "1844674407370955", 16 bytes
+header = 16 random bytes salt || 16 random bytes IV     // sent in CLEARTEXT
+key    = PBKDF2-HMAC-SHA512(security_key_utf8, salt, iterations=100000, output_len=32)
 ```
 
-AES-256-CBC, one continuous cipher stream per TCP direction (i.e. CBC
-chaining continues across the *entire* connection lifetime, not reset per
-packet — this is a single `CryptoStream` wrapping the socket for as long as
-it's open). This means: to decrypt/encrypt packet N you need the ciphertext
-of packet N-1's last block as the chaining value, not the original IV
-(except for the very first block of the connection).
+AES-256-CBC, one continuous cipher stream per TCP direction (CBC chaining
+continues across the *entire* connection lifetime, not reset per packet —
+a single `CryptoStream` wraps the socket for as long as it's open), chained
+from that direction's IV. Our outgoing key comes from our salt, our incoming
+key from the peer's salt, so the two directions use different keys.
 
-**Every new TCP connection, in both directions, starts with a throwaway
-16-byte "priming" block** (`Common.SendOrReceiveARandomDataBlockPerInitialIV`)
-sent/received *through the cipher* (not cleartext) immediately after the
-socket connects, before any real packet. Its plaintext content is
-meaningless — it exists purely to consume the first block. **Miss this and
-every subsequent byte you read/write is shifted by 16 bytes and looks like
-garbage** (this cost significant time — the framing looked broken when it
-was actually just misaligned by exactly one block).
+Sequence per direction, immediately on connect (`SocketStuff`'s lazily
+created `EncryptedStream`/`DecryptedStream`, then
+`Common.SendOrReceiveARandomDataBlockPerInitialIV`):
+1. 32-byte cleartext header (salt, IV).
+2. 16-byte encrypted "priming" block (random, discard). **Miss it and every
+   later byte is shifted by one block and looks like garbage.**
+3. Real packets begin.
 
-Sequence per direction, immediately on connect:
-1. 16-byte priming block (garbage, discard).
-2. Real packets begin.
+Windows may write its header before or after reading ours, so always write
+ours (header + priming) first, then read theirs — `open_encrypted_stream`.
+Applies to both the message server (15101) and the clipboard server (15100).
 
-No cleartext bytes are ever sent — both the priming block and everything
-after it are ciphertext from byte 0.
+The magic number (`Get24BitHash` below) is unchanged: still 50,000 SHA-512
+rounds over the key string.
 
 ## Packet framing
 

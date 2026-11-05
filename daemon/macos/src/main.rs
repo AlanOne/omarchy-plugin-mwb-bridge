@@ -14,9 +14,10 @@ mod keycode_macos;
 mod windows_keys;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use mwb_protocol::config::{self, Config};
 use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP};
@@ -42,6 +43,10 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
 // finding was on an already-established pairing — a first-time pairing
 // appears to need it. See the mwb-omarchy-bridge project memory.
 const LISTEN_PORT: u16 = 15101;
+
+/// The outbound connection to Windows, kept so a wake from sleep can cut it
+/// (see `watch_for_wake`).
+static CURRENT_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
 
 /// Local wall-clock time as HH:MM:SS.mmm, for lining log lines up with when
 /// a hitch was felt.
@@ -350,14 +355,39 @@ fn run_client(
     config::write_status(false, "", "Connecting...");
     let mut stream = TcpStream::connect(&cfg.windows_ip)?;
     set_socket_timeouts(&stream);
+    *CURRENT_STREAM.lock().unwrap() = stream.try_clone().ok();
     // Input is only sent one packet at a time; don't let Nagle batch the
     // rare reply (e.g. NextMachine) behind a pending ACK.
     let _ = stream.set_nodelay(true);
     // A new connection starts with nothing held — see CgInput::reset.
     cg.reset();
     let result = run_session(&mut stream, Some(&mut *cg), cfg, Some((clip_rx, clip_shared)));
+    CURRENT_STREAM.lock().unwrap().take();
     cg.reset();
     result
+}
+
+/// Drops the connection to Windows whenever the Mac wakes from sleep, so it
+/// reconnects right away. A connection that lived through a sleep is usually
+/// dead without either side knowing (the Mac sends nothing while idle), and
+/// it otherwise sat there until SOCKET_TIMEOUT — live-reported 2026-11-05:
+/// the lid opened at 08:08:03 but input only came back at 08:10:55. Sleep is
+/// noticed as the wall clock running ahead of `Instant`, which on macOS
+/// doesn't advance while asleep.
+fn watch_for_wake() {
+    const TICK: Duration = Duration::from_secs(2);
+    const SLEPT: Duration = Duration::from_secs(5);
+    loop {
+        let (wall, awake) = (SystemTime::now(), Instant::now());
+        std::thread::sleep(TICK);
+        let wall_elapsed = wall.elapsed().unwrap_or_default();
+        if wall_elapsed > awake.elapsed() + SLEPT
+            && let Some(stream) = CURRENT_STREAM.lock().unwrap().take()
+        {
+            println!("[client] {} Woke from sleep, reconnecting.", timestamp());
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 /// Keeps forwarded input smooth while this menu-bar-only app has no visible
@@ -415,6 +445,7 @@ fn network_thread(cfg: Config) {
         let cfg = cfg.clone();
         std::thread::spawn(move || run_server_listener(cfg));
     }
+    std::thread::spawn(watch_for_wake);
 
     let clip_shared = ClipboardShared::new();
     let (clip_tx, clip_rx) = mpsc::channel::<ClipboardEvent>();

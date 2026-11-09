@@ -11,6 +11,7 @@
 mod cg_input;
 mod clipboard;
 mod keycode_macos;
+mod route;
 mod windows_keys;
 
 use std::io::{Read, Write};
@@ -44,8 +45,8 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
 // appears to need it. See the mwb-omarchy-bridge project memory.
 const LISTEN_PORT: u16 = 15101;
 
-/// The outbound connection to Windows, kept so a wake from sleep can cut it
-/// (see `watch_for_wake`).
+/// The outbound connection to Windows, kept so a wake from sleep or a newly
+/// plugged-in cable can cut it (see `watch_for_wake`, `watch_for_wired_path`).
 static CURRENT_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
 
 /// Local wall-clock time as HH:MM:SS.mmm, for lining log lines up with when
@@ -353,7 +354,7 @@ fn run_client(
 ) -> std::io::Result<()> {
     println!("Connecting to {}...", cfg.windows_ip);
     config::write_status(false, "", "Connecting...");
-    let mut stream = TcpStream::connect(&cfg.windows_ip)?;
+    let mut stream = route::connect_preferring_wired(&cfg.windows_ip)?;
     set_socket_timeouts(&stream);
     *CURRENT_STREAM.lock().unwrap() = stream.try_clone().ok();
     // Input is only sent one packet at a time; don't let Nagle batch the
@@ -386,6 +387,39 @@ fn watch_for_wake() {
         {
             println!("[client] {} Woke from sleep, reconnecting.", timestamp());
             let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// Moves a connection that is on Wi-Fi over to a wired path once one exists
+/// (cable plugged in after connecting, or mDNS answering on Wi-Fi first) —
+/// see `route`'s module docs. Does nothing while already wired. Only cuts
+/// once per wired interface showing up, so a cable to a network Windows
+/// isn't on can't make it reconnect over and over.
+fn watch_for_wired_path(target: String) {
+    const TICK: Duration = Duration::from_secs(5);
+    let mut tried: Option<String> = None;
+    loop {
+        std::thread::sleep(TICK);
+        let local = CURRENT_STREAM.lock().unwrap().as_ref().and_then(|s| s.local_addr().ok());
+        let Some(current) = local.and_then(route::interface_of_local) else { continue };
+        if !route::is_wifi(&current) {
+            tried = None;
+            continue;
+        }
+        let wired = route::ranked_candidates(&target)
+            .ok()
+            .and_then(|c| c.into_iter().find_map(|(_, i)| i.filter(|i| !route::is_wifi(i))));
+        match wired {
+            None => tried = None,
+            Some(w) if tried.as_ref() != Some(&w) => {
+                if let Some(stream) = CURRENT_STREAM.lock().unwrap().take() {
+                    println!("[client] {} On Wi-Fi ({current}) but Windows is reachable over {w}, reconnecting.", timestamp());
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                tried = Some(w);
+            }
+            Some(_) => {}
         }
     }
 }
@@ -446,6 +480,10 @@ fn network_thread(cfg: Config) {
         std::thread::spawn(move || run_server_listener(cfg));
     }
     std::thread::spawn(watch_for_wake);
+    {
+        let target = cfg.windows_ip.clone();
+        std::thread::spawn(move || watch_for_wired_path(target));
+    }
 
     let clip_shared = ClipboardShared::new();
     let (clip_tx, clip_rx) = mpsc::channel::<ClipboardEvent>();

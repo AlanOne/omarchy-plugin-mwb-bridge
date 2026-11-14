@@ -55,9 +55,36 @@ pub struct Config {
     // straight to it, so the cursor doesn't detour through Windows.
     #[serde(default)]
     pub neighbors: HashMap<String, u32>,
+    // macOS only: more Windows PCs this machine can be controlled from (e.g.
+    // one at home, one at the office), each with its own PowerToys security
+    // key. The bridge connects to whichever one it can reach, trying
+    // `windows_ip` first. This machine needs the same `machine_name` in every
+    // PC's MWB layout. Ignored on Linux.
+    #[serde(default)]
+    pub other_windows_pcs: Vec<WindowsPc>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct WindowsPc {
+    pub windows_ip: String,
+    pub security_key: String,
 }
 
 impl Config {
+    /// One config per Windows PC to try, `windows_ip` first: this config
+    /// with its `windows_ip`/`security_key` swapped for each of
+    /// `other_windows_pcs` in turn.
+    pub fn per_windows_pc(&self) -> Vec<Config> {
+        let mut all = vec![self.clone()];
+        for pc in &self.other_windows_pcs {
+            let mut c = self.clone();
+            c.windows_ip = pc.windows_ip.clone();
+            c.security_key = pc.security_key.clone();
+            all.push(c);
+        }
+        all
+    }
+
     /// `neighbors` with its edge names parsed; unknown names are dropped.
     pub fn neighbor_edges(&self) -> Vec<(ScreenEdge, u32)> {
         self.neighbors.iter().filter_map(|(edge, &id)| Some((ScreenEdge::parse(edge)?, id))).collect()

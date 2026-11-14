@@ -535,7 +535,7 @@ fn serve_pending_image(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<
 /// Listens on the clipboard-server port for Windows connecting in to pull
 /// a pending big-path image. Mirrors the Linux build's
 /// `run_file_server_listener`.
-pub fn run_file_server_listener(cfg: Config, pending: Arc<Mutex<Option<PathBuf>>>) {
+pub fn run_file_server_listener(active: Arc<Mutex<Config>>, pending: Arc<Mutex<Option<PathBuf>>>) {
     let listener = match TcpListener::bind(("0.0.0.0", FILE_LISTEN_PORT)) {
         Ok(l) => l,
         Err(e) => {
@@ -550,7 +550,8 @@ pub fn run_file_server_listener(cfg: Config, pending: Arc<Mutex<Option<PathBuf>>
             Ok(stream) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(300)));
-                let cfg = cfg.clone();
+                // The PC we're currently connected to (its security key).
+                let cfg = active.lock().unwrap().clone();
                 let pending = pending.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = serve_pending_image(stream, &cfg, &pending) {

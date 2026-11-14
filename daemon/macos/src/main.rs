@@ -17,7 +17,7 @@ mod windows_keys;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use mwb_protocol::config::{self, Config};
@@ -396,11 +396,12 @@ fn watch_for_wake() {
 /// see `route`'s module docs. Does nothing while already wired. Only cuts
 /// once per wired interface showing up, so a cable to a network Windows
 /// isn't on can't make it reconnect over and over.
-fn watch_for_wired_path(target: String) {
+fn watch_for_wired_path(active: Arc<Mutex<Config>>) {
     const TICK: Duration = Duration::from_secs(5);
     let mut tried: Option<String> = None;
     loop {
         std::thread::sleep(TICK);
+        let target = active.lock().unwrap().windows_ip.clone();
         let local = CURRENT_STREAM.lock().unwrap().as_ref().and_then(|s| s.local_addr().ok());
         let Some(current) = local.and_then(route::interface_of_local) else { continue };
         if !route::is_wifi(&current) {
@@ -445,7 +446,7 @@ fn keep_input_responsive() {
 /// Accepts Windows' own reverse connection back to us — see `LISTEN_PORT`'s
 /// doc comment for why this turned out to matter live. Runs forever in its
 /// own thread; each accepted connection gets its own thread in turn.
-fn run_server_listener(cfg: Config) {
+fn run_server_listener(active: Arc<Mutex<Config>>) {
     let listener = match TcpListener::bind(("0.0.0.0", LISTEN_PORT)) {
         Ok(l) => l,
         Err(e) => {
@@ -460,7 +461,8 @@ fn run_server_listener(cfg: Config) {
             Ok(mut stream) => {
                 println!("[server] Accepted connection from {:?}", stream.peer_addr());
                 set_socket_timeouts(&stream);
-                let cfg = cfg.clone();
+                // The PC we're currently connected to (its security key).
+                let cfg = active.lock().unwrap().clone();
                 std::thread::spawn(move || {
                     if let Err(e) = run_session(&mut stream, None, &cfg, None) {
                         eprintln!("[server] Session ended: {e}");
@@ -475,14 +477,19 @@ fn run_server_listener(cfg: Config) {
 fn network_thread(cfg: Config) {
     keep_input_responsive();
     windows_keys::ENABLED.store(cfg.windows_keys, std::sync::atomic::Ordering::Relaxed);
+    // Every Windows PC this Mac can be controlled from; `active` is the one
+    // currently connected to (or last tried), which the listeners below
+    // answer with.
+    let pcs = cfg.per_windows_pc();
+    let active = Arc::new(Mutex::new(pcs[0].clone()));
     {
-        let cfg = cfg.clone();
-        std::thread::spawn(move || run_server_listener(cfg));
+        let active = active.clone();
+        std::thread::spawn(move || run_server_listener(active));
     }
     std::thread::spawn(watch_for_wake);
     {
-        let target = cfg.windows_ip.clone();
-        std::thread::spawn(move || watch_for_wired_path(target));
+        let active = active.clone();
+        std::thread::spawn(move || watch_for_wired_path(active));
     }
 
     let clip_shared = ClipboardShared::new();
@@ -492,19 +499,30 @@ fn network_thread(cfg: Config) {
         std::thread::spawn(move || clipboard::run_clipboard_watcher(clip_tx, clip_shared));
     }
     {
-        let cfg = cfg.clone();
+        let active = active.clone();
         let pending = clipboard::pending_outbound_image(&clip_shared);
-        std::thread::spawn(move || clipboard::run_file_server_listener(cfg, pending));
+        std::thread::spawn(move || clipboard::run_file_server_listener(active, pending));
     }
 
     // CGEventSource/CGEvent creation doesn't require the main thread —
     // unlike the menu bar UI, which tao/AppKit does require there — so this
     // runs entirely on its own background thread.
     let mut cg = CgInput::new();
+    // With several Windows PCs, a dropped connection retries the same PC
+    // first; one we can't reach moves on to the next.
+    let mut i = 0;
     loop {
-        if let Err(e) = run_client(&cfg, &mut cg, &clip_rx, &clip_shared) {
+        let pc = &pcs[i];
+        *active.lock().unwrap() = pc.clone();
+        let started = Instant::now();
+        if let Err(e) = run_client(pc, &mut cg, &clip_rx, &clip_shared) {
             eprintln!("{} Connection ended: {e}. Reconnecting in 3s...", timestamp());
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
+        }
+        // A session that ran a while was a real connection: retry that PC.
+        // One that ended almost at once (unreachable) moves on.
+        if started.elapsed() < Duration::from_secs(10) {
+            i = (i + 1) % pcs.len();
         }
         std::thread::sleep(Duration::from_secs(3));
     }

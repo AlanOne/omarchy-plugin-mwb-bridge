@@ -177,6 +177,18 @@ mapping instead, same division of responsibility XKB has on Linux). A
 template is written on first run if none exists; edit it via the menu bar
 icon's "Edit Config..." item, then "Restart App".
 
+**More than one Windows PC** (say one at home and one at the office): list
+the others in `other_windows_pcs`, each with its own PowerToys key. The Mac
+connects to whichever it can reach, trying `windows_ip` first, and a dropped
+connection retries the same PC before moving on. Add the Mac to each PC's
+MWB layout under the same `machine_name` and id (steps below).
+
+```json
+"other_windows_pcs": [
+  { "windows_ip": "home-pc.local:15101", "security_key": "that PC's key" }
+]
+```
+
 **Also requires the Windows PC to actually know about this machine** —
 PowerToys' Settings UI has a known bug (see `daemon/PROTOCOL.md`) where
 adding a new machine via the UI doesn't reliably persist to

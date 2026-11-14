@@ -126,12 +126,15 @@ fn set_socket_timeouts(stream: &TcpStream) {
 /// sync happens over the one connection real forwarding already runs over.
 /// Deliberately narrower than the Linux build otherwise: no image
 /// clipboard/lock/file handling yet. Returns (via `?`) on any I/O error so
-/// the caller reconnects/re-accepts.
+/// the caller reconnects/re-accepts. `handshook` is set once the peer
+/// answers our handshake challenge correctly, i.e. it's a PC we can work
+/// with (reachable, same key, knows this machine).
 fn run_session(
     stream: &mut TcpStream,
     mut cg: Option<&mut CgInput>,
     cfg: &Config,
     clipboard: Option<(&Receiver<ClipboardEvent>, &ClipboardShared)>,
+    handshook: &mut bool,
 ) -> std::io::Result<()> {
     let magic_number = get_24bit_hash(&cfg.security_key);
     let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(stream, &cfg.security_key)?;
@@ -252,6 +255,7 @@ fn run_session(
                 let matched =
                     m1 == our_flipped[0] && m2 == our_flipped[1] && m3 == our_flipped[2] && m4 == our_flipped[3];
                 println!("[client] HandshakeAck received, challenge match: {matched}");
+                *handshook |= matched;
                 let peer = String::from_utf8_lossy(&full[32..64]).trim_end().to_string();
                 let detail = if matched { "Connected" } else { "Handshake failed — check the security key" };
                 config::write_status(matched, &peer, detail);
@@ -351,6 +355,7 @@ fn run_client(
     cg: &mut CgInput,
     clip_rx: &Receiver<ClipboardEvent>,
     clip_shared: &ClipboardShared,
+    handshook: &mut bool,
 ) -> std::io::Result<()> {
     println!("Connecting to {}...", cfg.windows_ip);
     config::write_status(false, "", "Connecting...");
@@ -362,7 +367,7 @@ fn run_client(
     let _ = stream.set_nodelay(true);
     // A new connection starts with nothing held — see CgInput::reset.
     cg.reset();
-    let result = run_session(&mut stream, Some(&mut *cg), cfg, Some((clip_rx, clip_shared)));
+    let result = run_session(&mut stream, Some(&mut *cg), cfg, Some((clip_rx, clip_shared)), handshook);
     CURRENT_STREAM.lock().unwrap().take();
     cg.reset();
     result
@@ -464,7 +469,7 @@ fn run_server_listener(active: Arc<Mutex<Config>>) {
                 // The PC we're currently connected to (its security key).
                 let cfg = active.lock().unwrap().clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = run_session(&mut stream, None, &cfg, None) {
+                    if let Err(e) = run_session(&mut stream, None, &cfg, None, &mut false) {
                         eprintln!("[server] Session ended: {e}");
                     }
                 });
@@ -508,24 +513,28 @@ fn network_thread(cfg: Config) {
     // unlike the menu bar UI, which tao/AppKit does require there — so this
     // runs entirely on its own background thread.
     let mut cg = CgInput::new();
-    // With several Windows PCs, a dropped connection retries the same PC
-    // first; one we can't reach moves on to the next.
     let mut i = 0;
     loop {
         let pc = &pcs[i];
         *active.lock().unwrap() = pc.clone();
-        let started = Instant::now();
-        if let Err(e) = run_client(pc, &mut cg, &clip_rx, &clip_shared) {
+        let mut handshook = false;
+        if let Err(e) = run_client(pc, &mut cg, &clip_rx, &clip_shared, &mut handshook) {
             eprintln!("{} Connection ended: {e}. Reconnecting in 3s...", timestamp());
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
         }
-        // A session that ran a while was a real connection: retry that PC.
-        // One that ended almost at once (unreachable) moves on.
-        if started.elapsed() < Duration::from_secs(10) {
-            i = (i + 1) % pcs.len();
-        }
+        i = next_pc(i, pcs.len(), handshook);
         std::thread::sleep(Duration::from_secs(3));
     }
+}
+
+/// Which Windows PC to try after PC `i` of `count`: the same one again if
+/// its session got through the handshake (a real connection that dropped),
+/// else the next. Deciding by handshake rather than by how long the attempt
+/// took matters: a PC that is on the network but not listening only fails
+/// after every address has timed out (~15s), which looked like a real
+/// connection and kept the loop on that PC forever (seen live 2026-11-14).
+fn next_pc(i: usize, count: usize, handshook: bool) -> usize {
+    if handshook { i } else { (i + 1) % count }
 }
 
 /// Writes a starter config.json (with an obviously-fake security key and
@@ -574,3 +583,27 @@ fn main() {
 }
 
 mod tray;
+
+#[cfg(test)]
+mod tests {
+    use super::next_pc;
+
+    #[test]
+    fn retries_a_pc_that_completed_the_handshake() {
+        assert_eq!(next_pc(0, 2, true), 0);
+        assert_eq!(next_pc(1, 2, true), 1);
+    }
+
+    #[test]
+    fn moves_on_from_a_pc_that_never_completed_the_handshake() {
+        // Unreachable, slow to time out, or the wrong key: all the same.
+        assert_eq!(next_pc(0, 2, false), 1);
+        assert_eq!(next_pc(1, 2, false), 0);
+    }
+
+    #[test]
+    fn a_single_pc_is_always_retried() {
+        assert_eq!(next_pc(0, 1, false), 0);
+        assert_eq!(next_pc(0, 1, true), 0);
+    }
+}
